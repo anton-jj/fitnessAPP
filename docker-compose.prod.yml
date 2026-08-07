@@ -1,0 +1,39 @@
+# Production stack for the Debian host.
+#
+# This pulls prebuilt images from GHCR instead of building on the box, so a
+# deploy is a download and a restart rather than a compile.
+#
+#   IMAGE_OWNER   your GitHub owner/repo in lowercase, e.g. anton-jj/fitnessapp
+#   IMAGE_TAG     "latest", or a commit sha to pin/roll back
+#   WEB_PORT      host port for the UI (default 8080, to stay out of the way
+#                 of anything else already on :80)
+#
+# Usage:  ./deploy.sh          (see that script for the full flow)
+
+services:
+  api:
+    image: ghcr.io/${IMAGE_OWNER}-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - pulse-data:/app/data
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health').status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  web:
+    image: ghcr.io/${IMAGE_OWNER}-web:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  pulse-data:
