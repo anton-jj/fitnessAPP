@@ -144,6 +144,11 @@ class AthleteProfile(Base):
     has_power_meter = Column(Boolean, default=False)
     has_hr_monitor = Column(Boolean, default=True)
     max_sessions_per_day = Column(Integer, default=1)
+    # Hard limits per discipline, e.g. {"swimming": {"max_sessions": 2,
+    # "days": ["tuesday", "thursday"]}} for an athlete whose pool is only open
+    # on those days. Constraints, not preferences — the planner must not
+    # schedule training the athlete cannot physically do.
+    sport_limits = Column(JSON)
     auto_push = Column(Boolean, default=False)  # auto-push workouts to watch daily
     notes = Column(Text)
     onboarding_complete = Column(Boolean, default=False)

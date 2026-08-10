@@ -115,10 +115,62 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ workout, date }),
     }),
+  pushPlan: (planId: number, weekNumber?: number) =>
+    request<any>('/ai/push-plan', {
+      method: 'POST',
+      body: JSON.stringify({ plan_id: planId, week_number: weekNumber }),
+    }),
+  planCompliance: (planId: number) => request<any>(`/ai/plan/${planId}/compliance`),
+  adaptPlan: (planId: number) =>
+    request<any>(`/ai/plan/${planId}/adapt`, { method: 'POST' }),
+  planCalendarUrl: (planId: number) =>
+    `${window.location.origin}${BASE}/ai/plan/${planId}/calendar.ics`,
+
+  // .fit workout file for direct import into Garmin Connect or the COROS app
+  downloadWorkoutFile: async (workout: any, date: string) => {
+    const res = await fetch(`${BASE}/ai/workout-file`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workout, date }),
+    })
+    if (!res.ok) throw new Error('Could not build the workout file')
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${date}_${(workout.name || 'workout').replace(/[^a-z0-9]/gi, '_')}.fit`
+    a.click()
+    URL.revokeObjectURL(url)
+  },
 
   profile: () => request<any>('/profile'),
   updateProfile: (data: any) => request<any>('/profile', { method: 'PUT', body: JSON.stringify(data) }),
-  generateFullPlan: () => request<any>('/profile/generate-plan', { method: 'POST' }),
+  generateFullPlan: (start: 'this_week' | 'next_week' = 'next_week') =>
+    request<any>('/profile/generate-plan', {
+      method: 'POST',
+      body: JSON.stringify({ start }),
+    }),
+  generatePlanStatus: () => request<any>('/profile/generate-plan/status'),
+
+  // Generation runs as a background job on the server, so start it and poll
+  // rather than holding a request open for several minutes.
+  generateFullPlanAndWait: async (
+    onTick?: (seconds: number) => void,
+    start: 'this_week' | 'next_week' = 'next_week',
+  ) => {
+    await api.generateFullPlan(start)
+    const startedAt = Date.now()
+    while (true) {
+      await new Promise((r) => setTimeout(r, 3000))
+      const state = await api.generatePlanStatus()
+      onTick?.(Math.round((Date.now() - startedAt) / 1000))
+      if (state.status === 'done') return state
+      if (state.status === 'error') throw new Error(state.error || 'Plan generation failed')
+      if (Date.now() - startedAt > 15 * 60 * 1000) {
+        throw new Error('Plan generation timed out after 15 minutes')
+      }
+    }
+  },
 
   settings: () => request<any>('/settings'),
   updateSettings: (data: any) => request<any>('/settings', { method: 'PUT', body: JSON.stringify(data) }),

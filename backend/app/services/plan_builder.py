@@ -16,6 +16,18 @@ fitness). Intensity compensates only when volume cannot increase.
 The plan builder computes the ENVELOPE — duration targets, quality
 session slots, sport distribution, recovery scheduling, safety bounds.
 The AI coach fills in workout design, progression, and coaching rationale.
+
+Two rules drive most of the shape of a week:
+
+  Frequency follows volume. Extra hours buy extra sessions, not longer
+  ones — roughly 1 session per discipline below 5h/week, 2 by 5-9h,
+  3 by 9-14h, 4+ beyond that. Spreading 12 hours over seven single
+  sessions gives 100-minute averages and only two swims; the same hours
+  as ten sessions gives a triathlete 3-3-3 at sane lengths.
+
+  Added frequency goes to the cheapest discipline first. Swimming and
+  cycling absorb extra sessions without much orthopedic cost, so they
+  grow before running does.
 """
 from datetime import datetime, timedelta
 
@@ -66,17 +78,26 @@ SPORT_PROPERTIES = {
         "max_session_minutes": 150,
         "max_easy_minutes": 90,
         "max_long_minutes": 150,
-        "max_weekly_increase_pct": 0.10,
+        "max_weekly_increase_pct": 0.12,
         "typical_endurance_minutes": 60,
+        "session_weight": 1.0,
+        "volume_weight": 0.95,
+        "max_weekly_sessions": 7,
         "frequency_notes": "protect key sessions, cautious volume increases",
     },
     "cycling": {
         "stress_factor": 0.4,
-        "max_session_minutes": 240,
-        "max_easy_minutes": 120,
-        "max_long_minutes": 180,
-        "max_weekly_increase_pct": 0.15,
-        "typical_endurance_minutes": 90,
+        "max_session_minutes": 300,
+        "max_easy_minutes": 150,
+        "max_long_minutes": 240,
+        "max_weekly_increase_pct": 0.20,
+        "typical_endurance_minutes": 105,
+        # The bike carries the block. Extra hours buy extra rides first, and
+        # each ride is a little longer than the others — but frequency leads,
+        # so most of the share comes from session_weight, not volume_weight.
+        "session_weight": 1.35,
+        "volume_weight": 1.2,
+        "max_weekly_sessions": 10,
         "frequency_notes": "primary volume expander, handles long sessions well",
     },
     "swimming": {
@@ -84,8 +105,11 @@ SPORT_PROPERTIES = {
         "max_session_minutes": 75,
         "max_easy_minutes": 60,
         "max_long_minutes": 75,
-        "max_weekly_increase_pct": 0.15,
+        "max_weekly_increase_pct": 0.20,
         "typical_endurance_minutes": 45,
+        "session_weight": 1.0,
+        "volume_weight": 0.80,
+        "max_weekly_sessions": 6,
         "frequency_priority": True,
         "frequency_notes": "frequency is more valuable than long sessions",
     },
@@ -230,6 +254,120 @@ def compute_capacity_assessment(weekly_hours: float, event: str,
     }
 
 
+# Average endurance session length across a week, used to turn available hours
+# into a session count. Sessions get longer as volume grows — a 4h athlete
+# trains in 50-minute blocks, a 16h athlete in 90-minute ones — so this is not
+# a constant.
+def _average_session_hours(weekly_hours: float) -> float:
+    # Interpolated rather than banded: a step function makes 14h produce fewer
+    # sessions than 13h, which is not something a plan should ever do.
+    low_h, low_len = 4.0, 0.85
+    high_h, high_len = 18.0, 1.35
+    if weekly_hours <= low_h:
+        return low_len
+    if weekly_hours >= high_h:
+        return high_len
+    span = (weekly_hours - low_h) / (high_h - low_h)
+    return low_len + span * (high_len - low_len)
+
+
+def compute_session_target(weekly_hours: float, n_sports: int, n_days: int,
+                           max_sessions_per_day: int = 1) -> int:
+    """How many endurance sessions the week should contain.
+
+    Frequency has to follow volume, not the calendar. Spreading 12 hours over
+    seven days gives 100-minute averages and only two swims; the same hours as
+    nine or ten sessions gives a triathlete 3-3-3 with sane session lengths.
+
+    Roughly:  <5h -> 1 per sport,  5-9h -> 2 per sport,
+              9-14h -> 3 per sport,  14h+ -> 4+ per sport
+    """
+    target = round(weekly_hours / _average_session_hours(weekly_hours))
+    target = max(target, n_sports)
+    return min(target, n_days * max(1, max_sessions_per_day))
+
+
+# How much the athlete's main discipline outranks the others when sessions are
+# shared out. Large enough that a marathoner runs more than they ride, even
+# though the bike is the cheaper place to put volume.
+PRIMARY_SESSION_BONUS = 1.40
+
+
+def _sport_ceiling(sport: str, limits: dict | None = None) -> int:
+    """Weekly session ceiling for a discipline, athlete's limit taking priority."""
+    default = SPORT_PROPERTIES.get(sport, {}).get("max_weekly_sessions", 7)
+    stated = (limits or {}).get(sport, {}).get("max_sessions")
+    return min(default, stated) if stated else default
+
+
+def _allocate_sport_sessions(real_sports: list[str], total_sessions: int,
+                             primary_sport: str | None,
+                             limits: dict | None = None) -> dict[str, int]:
+    """Split the week's sessions across disciplines.
+
+    Everyone gets one, then the rest are dealt round-robin starting with the
+    primary sport and then the least orthopedically costly one. That keeps the
+    common case even (3-3-3 for a triathlete) while sending any odd session to
+    swimming and cycling — the disciplines that can absorb extra frequency
+    without extra injury risk.
+    """
+    counts = {s: 1 for s in real_sports}
+    remaining = total_sessions - len(real_sports)
+    if remaining <= 0:
+        return counts
+
+    # Extras are shared by session weight, not evenly: the bike absorbs the
+    # most because a ride costs less recovery than a run of the same length,
+    # and swimming outranks running because frequency is what it needs.
+    # Take the stronger of the two claims rather than multiplying them: for a
+    # triathlete cycling is both the volume engine and the primary sport, and
+    # stacking the bonuses buries swimming and running.
+    weights = {
+        sport: max(
+            SPORT_PROPERTIES.get(sport, {}).get("session_weight", 1.0),
+            PRIMARY_SESSION_BONUS if sport == primary_sport else 0.0,
+        )
+        for sport in real_sports
+    }
+    total_weight = sum(weights.values()) or 1.0
+
+    exact = {s: remaining * w / total_weight for s, w in weights.items()}
+    extra = {s: int(v) for s, v in exact.items()}
+    leftover = remaining - sum(extra.values())
+    for sport in sorted(exact, key=lambda s: exact[s] - extra[s], reverse=True):
+        if leftover <= 0:
+            break
+        extra[sport] += 1
+        leftover -= 1
+
+    for sport, n in extra.items():
+        counts[sport] += n
+
+    # Respect per-sport ceilings, pushing any overflow to whoever has room.
+    def ceiling(sport: str) -> int:
+        return _sport_ceiling(sport, limits)
+
+    overflow = 0
+    for sport in real_sports:
+        if counts[sport] > ceiling(sport):
+            overflow += counts[sport] - ceiling(sport)
+            counts[sport] = ceiling(sport)
+
+    order = sorted(real_sports, key=lambda s: -weights[s])
+    while overflow > 0:
+        placed = False
+        for sport in order:
+            if counts[sport] < ceiling(sport):
+                counts[sport] += 1
+                overflow -= 1
+                placed = True
+                break
+        if not placed:
+            break
+
+    return counts
+
+
 def compute_quality_sessions(weekly_hours: float, experience: str,
                              capacity_strategy: str) -> int:
     """Quality sessions stay roughly constant regardless of volume.
@@ -248,12 +386,9 @@ def compute_quality_sessions(weekly_hours: float, experience: str,
     if experience == "beginner":
         return 1 if weekly_hours < 4 else 2
 
-    if weekly_hours < 4:
+    if weekly_hours < 10:
         return 2
-    elif weekly_hours < 12:
-        return 2
-    else:
-        return 3
+    return 3
 
 
 def compute_training_density(weekly_hours: float,
@@ -285,18 +420,22 @@ def compute_training_density(weekly_hours: float,
 
 def compute_recovery_schedule(total_weeks: int,
                               experience: str) -> list[str]:
-    """Plan recovery weeks every 3-5 weeks with 20-40% volume reduction.
+    """Plan recovery weeks with a 20-40% volume reduction.
 
-    Beginners: every 3 weeks (2 build + 1 recovery)
-    Intermediate: every 4 weeks (3 build + 1 recovery)
-    Advanced: every 4-5 weeks (3-4 build + 1 recovery)
+    Beginners: every 4 weeks (3 build + 1 recovery)
+    Intermediate: every 5 weeks (4 build + 1 recovery)
+    Advanced: every 6 weeks (5 build + 1 recovery)
+
+    Cutting back every third week costs more fitness than it saves for anyone
+    past their first season — the point of a recovery week is to absorb
+    accumulated load, and at moderate volume that load takes longer to build.
     """
     if experience == "beginner":
-        build_count = 2
-    elif experience == "advanced":
-        build_count = 4
-    else:
         build_count = 3
+    elif experience == "advanced":
+        build_count = 5
+    else:
+        build_count = 4
 
     cycle = build_count + 1
     week_types = []
@@ -308,6 +447,81 @@ def compute_recovery_schedule(total_weeks: int,
             week_types.append("build")
 
     return week_types
+
+
+# --- Where the block starts ---
+
+def _resolve_starting_volume(profile: dict) -> tuple[float | None, str]:
+    """Pick the opening volume, and say where the number came from.
+
+    An explicit answer wins — the athlete may know something the data does
+    not, like a block of travel ahead. Otherwise observed history wins over a
+    default, because what someone actually trained last month predicts next
+    month better than a slider they moved once during onboarding.
+    """
+    stated = profile.get("current_weekly_hours")
+    observed = profile.get("observed_weekly_hours")
+
+    if stated:
+        return float(stated), "stated"
+    if observed:
+        return float(observed), "observed"
+    return None, "default"
+
+
+# Training Stress Balance: negative means carrying fatigue, positive means
+# fresh. These thresholds are deliberately wide — TSB swings a lot day to day
+# and only a clear signal should change how a block opens.
+TSB_BURIED = -25
+TSB_TIRED = -10
+TSB_VERY_FRESH = 15
+
+
+def compute_readiness(fitness_context: dict | None) -> dict:
+    """Adjust the opening week for how the athlete is actually turning up.
+
+    Starting a build block on top of deep fatigue is how people get injured or
+    quit in week two. If the athlete arrives buried, the block opens easier and
+    the ramp catches up later.
+    """
+    if not fitness_context:
+        return {"state": "unknown", "multiplier": 1.0, "note": ""}
+
+    tsb = fitness_context.get("tsb")
+    ctl = fitness_context.get("ctl")
+
+    if tsb is None:
+        return {"state": "unknown", "multiplier": 1.0, "note": ""}
+
+    if tsb <= TSB_BURIED:
+        return {
+            "state": "fatigued",
+            "multiplier": 0.90,
+            "note": (
+                f"Starting {round((1 - 0.85) * 100)}% easier than planned: your form "
+                f"(TSB {tsb:.0f}) says you are carrying real fatigue into this block. "
+                "The ramp catches up once you have absorbed it."
+            ),
+        }
+    if tsb <= TSB_TIRED:
+        return {
+            "state": "tired",
+            "multiplier": 0.95,
+            "note": (
+                f"Opening slightly easier — TSB {tsb:.0f} suggests you are still "
+                "carrying fatigue from recent training."
+            ),
+        }
+    if tsb >= TSB_VERY_FRESH and ctl is not None and ctl < 40:
+        return {
+            "state": "detrained",
+            "multiplier": 1.0,
+            "note": (
+                f"Your fitness (CTL {ctl:.0f}) is low and you are well rested, so "
+                "this block is about rebuilding consistency before intensity."
+            ),
+        }
+    return {"state": "ready", "multiplier": 1.0, "note": ""}
 
 
 def _assess_progression(multipliers: list[float], week_types: list[str],
@@ -366,12 +580,12 @@ def compute_volume_reduction(week_type: str, experience: str) -> float:
     return 1.0
 
 
-MAX_WEEKLY_INCREASE = {"beginner": 0.06, "advanced": 0.10}
-DEFAULT_MAX_INCREASE = 0.08
+MAX_WEEKLY_INCREASE = {"beginner": 0.08, "advanced": 0.12}
+DEFAULT_MAX_INCREASE = 0.10
 
 # Never open a block below this fraction of the athlete's stated hours. They
 # told us the time is available; starting much lower wastes the block.
-MIN_START_FRACTION = 0.70
+MIN_START_FRACTION = 0.85
 
 
 def compute_volume_progression(week_types: list[str], experience: str,
@@ -445,153 +659,147 @@ def _estimate_distance(sport: str, workout_type: str, duration_minutes: int,
     return round(speed * duration_minutes / 60, 1)
 
 
+# Which discipline anchors the week when the athlete has not said. Triathlon
+# events point at the bike: it carries the most race time and the most
+# trainable volume per unit of fatigue.
 EVENT_PRIMARY_SPORT = {
-    "5k": "running", "10k": "running", "half_marathon": "running",
+    "5k": "running",
+    "10k": "running",
+    "half_marathon": "running",
     "marathon": "running",
+    "sprint_triathlon": "cycling",
+    "olympic_triathlon": "cycling",
+    "ironman_70.3": "cycling",
+    "ironman": "cycling",
 }
 
 
-def _allocate_sport_days(real_sports: list[str], n_days: int,
-                        primary_sport: str | None) -> dict[str, int]:
-    """Decide how many sessions each discipline gets before choosing days.
-
-    Dealing days out round-robin starves whichever sport sorts last, which is
-    always swimming — the one discipline whose value comes from frequency
-    rather than session length. Session counts are allocated first so a
-    triathlete gets to swim more than once a week.
-    """
-    weights: dict[str, float] = {}
-    for sport in real_sports:
-        props = SPORT_PROPERTIES.get(sport, {})
-        weight = 1.0
-        if props.get("frequency_priority"):
-            weight *= 1.15
-        if sport == primary_sport:
-            weight *= 1.35
-        weights[sport] = weight
-
-    total_weight = sum(weights.values()) or 1.0
-    exact = {s: n_days * w / total_weight for s, w in weights.items()}
-    counts = {s: int(v) for s, v in exact.items()}
-
-    # Largest-remainder so the counts add up to exactly the days available.
-    leftover = n_days - sum(counts.values())
-    for sport in sorted(exact, key=lambda s: exact[s] - counts[s], reverse=True):
-        if leftover <= 0:
-            break
-        counts[sport] += 1
-        leftover -= 1
-
-    # Every discipline in the plan should appear at least once, and a
-    # frequency-priority sport needs at least two touches to be worth doing.
-    for sport in real_sports:
-        floor = 2 if SPORT_PROPERTIES.get(sport, {}).get("frequency_priority") else 1
-        floor = min(floor, max(1, n_days // len(real_sports)))
-        while counts[sport] < floor:
-            donor = max(counts, key=lambda s: counts[s] - (
-                2 if SPORT_PROPERTIES.get(s, {}).get("frequency_priority") else 1))
-            if donor == sport or counts[donor] <= 1:
-                break
-            counts[donor] -= 1
-            counts[sport] += 1
-
-    return counts
-
-
 def _build_sport_schedule(sports: list[str], quality_days: list[str],
-                          easy_days: list[str],
-                          primary_sport: str | None = None) -> dict[str, str]:
-    """Assign a discipline to every training day.
+                          easy_days: list[str], primary_sport: str | None,
+                          total_sessions: int,
+                          max_sessions_per_day: int = 1,
+                          limits: dict | None = None) -> list[dict]:
+    """Place every session of the week on a day.
 
-    Session counts come first (see _allocate_sport_days), then days are chosen:
-    quality days go to the disciplines the athlete does most, weekend days to
-    whichever remaining sport carries the longest sessions, and the rest are
-    spread so the same sport avoids back-to-back days.
+    Returns a flat list of {day, sport} slots — more than one per day once the
+    volume calls for it. Session counts come from the frequency model, so this
+    only decides placement: quality days go to different disciplines, weekend
+    days to whichever sport carries the longest session, and second sessions
+    land on the lightest non-quality days in a different sport from the first.
     """
     real_sports = [s for s in sports if s != "strength"]
     if not real_sports:
-        return {d: "cycling" for d in DAY_ORDER}
-    if len(real_sports) == 1:
-        return {d: real_sports[0] for d in DAY_ORDER}
+        real_sports = ["cycling"]
 
     training_days = list(quality_days) + list(easy_days)
-    remaining = _allocate_sport_days(real_sports, len(training_days), primary_sport)
-    schedule: dict[str, str] = {}
+    if not training_days:
+        return []
 
-    def take(sport: str, day: str) -> None:
-        schedule[day] = sport
+    remaining = _allocate_sport_sessions(real_sports, total_sessions,
+                                         primary_sport, limits)
+    slots: list[dict] = []
+    day_sports: dict[str, set[str]] = {}
+
+    def allowed(sport: str, day: str) -> bool:
+        """A discipline the athlete can only do on certain days — pool hours,
+        a club session, a shared turbo — must never be scheduled elsewhere."""
+        days = (limits or {}).get(sport, {}).get("days")
+        return not days or day in days
+
+    def usable(day: str) -> list[str]:
+        return [s for s in real_sports if remaining[s] > 0 and allowed(s, day)]
+
+    def place(sport: str, day: str) -> None:
+        slots.append({"day": day, "sport": sport})
+        day_sports.setdefault(day, set()).add(sport)
         remaining[sport] -= 1
 
-    # Quality goes to the disciplines with the most sessions — that is where
-    # the athlete has the base to absorb it — but each discipline gets at most
-    # one hard day, so a second quality slot moves to another sport.
+    # 1. Quality days — one per discipline where possible.
     quality_used: set[str] = set()
     for day in quality_days:
-        available = [s for s in real_sports if remaining[s] > 0]
+        available = usable(day)
         if not available:
-            break
+            continue
         fresh = [s for s in available if s not in quality_used] or available
         pick = max(fresh, key=lambda s: (remaining[s], s == primary_sport))
         quality_used.add(pick)
-        take(pick, day)
+        place(pick, day)
 
-    leftover_days = [d for d in easy_days if d not in schedule]
-
-    # Weekends suit the long session, so give them to the sports that can use
-    # the time — primary sport first, and not the same sport twice.
+    # 2. Weekends carry the long sessions.
+    leftover = [d for d in easy_days if d not in day_sports]
     weekend_used: set[str] = set()
     for day in ("saturday", "sunday"):
-        if day not in leftover_days:
+        if day not in leftover:
             continue
-        available = [s for s in real_sports if remaining[s] > 0]
+        available = usable(day)
         if not available:
-            break
+            continue
         fresh = [s for s in available if s not in weekend_used] or available
         pick = max(fresh, key=lambda s: (
             s == primary_sport,
             SPORT_PROPERTIES.get(s, {}).get("max_long_minutes", 0),
         ))
         weekend_used.add(pick)
-        take(pick, day)
-        leftover_days.remove(day)
+        place(pick, day)
+        leftover.remove(day)
 
-    # Spread what is left, avoiding the same sport on consecutive days.
-    for day in leftover_days:
-        available = [s for s in real_sports if remaining[s] > 0]
+    # 3. One session on each remaining day, avoiding the same sport two days
+    #    running.
+    for day in leftover:
+        available = usable(day)
         if not available:
-            break
-        previous = schedule.get(DAY_ORDER[(DAY_ORDER.index(day) - 1) % 7])
-        spaced = [s for s in available if s != previous] or available
-        take(max(spaced, key=lambda s: remaining[s]), day)
+            continue
+        previous = day_sports.get(DAY_ORDER[(DAY_ORDER.index(day) - 1) % 7], set())
+        spaced = [s for s in available if s not in previous] or available
+        place(max(spaced, key=lambda s: remaining[s]), day)
 
-    for day in DAY_ORDER:
-        schedule.setdefault(day, real_sports[0])
+    # 4. Anything still owed becomes a second session. These go on the days
+    #    carrying the least so far, and never double up the same discipline.
+    if max_sessions_per_day > 1:
+        guard = 0
+        while any(n > 0 for n in remaining.values()) and guard < 50:
+            guard += 1
+            candidates = [
+                d for d in training_days
+                if len(day_sports.get(d, set())) < max_sessions_per_day
+                and d not in quality_days
+            ] or [
+                d for d in training_days
+                if len(day_sports.get(d, set())) < max_sessions_per_day
+            ]
+            if not candidates:
+                break
+            day = min(candidates, key=lambda d: len(day_sports.get(d, set())))
+            available = [s for s in usable(day)
+                         if s not in day_sports.get(day, set())]
+            if not available:
+                # Nothing new can go on the emptiest day; retire it and retry.
+                day_sports.setdefault(day, set()).update(real_sports)
+                continue
+            place(max(available, key=lambda s: remaining[s]), day)
 
-    return schedule
+    slots.sort(key=lambda s: DAY_ORDER.index(s["day"]))
+    return slots
 
 
-# --- Session archetypes ---
-#
-# Each discipline gets at most one session of each archetype per week:
-#   quality — structured intensity (0 or 1)
-#   long    — the single longest endurance session for that sport
-#   easy    — one or more aerobic sessions
-#
-# When several schedules satisfy the weekly volume target, prefer the one
-# that uses appropriately sized sessions over fewer oversized ones, and
-# routes surplus endurance volume into the designated long session.
-
-def _assign_archetypes(sport_schedule: dict[str, str], training_days: list[str],
-                       quality_days: list[str],
+def _assign_archetypes(schedule: list[dict], quality_days: list[str],
                        long_session_essential: bool) -> list[dict]:
-    slots = [
-        {
-            "day": day,
-            "sport": sport_schedule.get(day, "cycling"),
-            "archetype": "quality" if day in quality_days else "easy",
-        }
-        for day in training_days
-    ]
+    """Tag each placed session with its archetype.
+
+    Only the first session of a quality day is a quality session — a second
+    session that day is there to add easy volume, not more intensity.
+    """
+    slots = []
+    quality_taken: set[str] = set()
+    for entry in schedule:
+        is_quality = entry["day"] in quality_days and entry["day"] not in quality_taken
+        if is_quality:
+            quality_taken.add(entry["day"])
+        slots.append({
+            "day": entry["day"],
+            "sport": entry["sport"],
+            "archetype": "quality" if is_quality else "easy",
+        })
 
     by_sport: dict[str, list[dict]] = {}
     for slot in slots:
@@ -629,11 +837,20 @@ def _slot_floor(slot: dict, week_type: str = "build") -> int:
     claims a higher floor so that a week which cannot afford both frequency
     and a real long session gives up a frequency day rather than the long one.
     """
+    props = SPORT_PROPERTIES.get(slot["sport"], {})
     base = MIN_SESSION_DURATION if week_type in ("recovery", "taper") else MIN_ENDURANCE_DURATION
-    if SPORT_PROPERTIES.get(slot["sport"], {}).get("frequency_priority"):
+
+    if props.get("frequency_priority"):
         # A short technique swim is worth doing; holding swimming to the same
         # floor as a run is what makes it the first thing cut from a thin week.
         base = MIN_SESSION_DURATION
+    else:
+        # Otherwise scale the floor to what a session of that sport normally
+        # looks like. An hour on the bike is a short ride; an hour running is
+        # not a short run. Weighting only the surplus above a shared floor
+        # leaves every discipline the same size at low volume.
+        base = max(base, round(props.get("typical_endurance_minutes", 60) * 0.6))
+
     if slot["archetype"] == "long":
         base = round(base * 1.5)
     return min(base, _slot_cap(slot, week_type))
@@ -700,8 +917,10 @@ def _allocate_slot_durations(slots: list[dict], total_minutes: float,
     for slot in active:
         slot["duration"] = float(_slot_floor(slot, week_type))
         props = SPORT_PROPERTIES.get(slot["sport"], {})
-        slot["_weight"] = props.get("typical_endurance_minutes", 60) * (
-            1.7 if slot["archetype"] == "long" else 1.0
+        slot["_weight"] = (
+            props.get("typical_endurance_minutes", 60)
+            * props.get("volume_weight", 1.0)
+            * (1.7 if slot["archetype"] == "long" else 1.0)
         )
 
     surplus = pool - sum(s["duration"] for s in active)
@@ -750,59 +969,6 @@ def _demote_undersized_long_sessions(slots: list[dict]) -> None:
         ]
         if peers and slot["duration"] < max(peers) * 1.2:
             slot["archetype"] = "easy"
-
-
-def _add_second_sessions(slots: list[dict], unfitted: int, sports: list[str],
-                         quality_days: list[str],
-                         max_sessions_per_day: int) -> tuple[list[dict], int]:
-    """Absorb leftover volume as second sessions rather than oversized ones.
-
-    Beyond roughly 10h/week the volume stops fitting into one session per day.
-    Splitting it into a short second session is what the extra time actually
-    buys — lengthening the existing sessions past their caps is not.
-    """
-    if max_sessions_per_day < 2 or unfitted < MIN_ENDURANCE_DURATION:
-        return slots, unfitted
-
-    low_stress = sorted(
-        (s for s in sports if s != "strength"),
-        key=lambda s: SPORT_PROPERTIES.get(s, {}).get("stress_factor", 1.0),
-    )
-    if not low_stress:
-        return slots, unfitted
-
-    per_day: dict[str, float] = {}
-    sports_on_day: dict[str, set[str]] = {}
-    for slot in slots:
-        per_day[slot["day"]] = per_day.get(slot["day"], 0) + slot["duration"]
-        sports_on_day.setdefault(slot["day"], set()).add(slot["sport"])
-
-    candidates = sorted(
-        (d for d in per_day if d not in quality_days),
-        key=lambda d: per_day[d],
-    )
-
-    added = []
-    for i, day in enumerate(candidates):
-        if unfitted < MIN_ENDURANCE_DURATION:
-            break
-        # A second session should add a different stimulus, not repeat the day's
-        # sport — two swims on one Monday is worse than a swim and a spin.
-        fresh = [s for s in low_stress if s not in sports_on_day.get(day, set())]
-        sport = (fresh or low_stress)[i % len(fresh or low_stress)]
-        sports_on_day.setdefault(day, set()).add(sport)
-        duration = _round_duration(min(unfitted, SPORT_PROPERTIES.get(sport, {})
-                                       .get("max_easy_minutes", 60), 60))
-        added.append({
-            "day": day,
-            "sport": sport,
-            "archetype": "easy",
-            "duration": duration,
-            "workout_type": "recovery",
-        })
-        unfitted -= duration
-
-    return slots + added, max(0, unfitted)
 
 
 QUALITY_TYPE_ROTATION = ["threshold", "sweetspot", "vo2max", "tempo"]
@@ -907,18 +1073,25 @@ def _run_step(workout_type: str, duration_secs: int, threshold_pace: int,
               step_type: str = "steady", extra_note: str = "") -> dict:
     """A running step targets a pace, not a share of FTP."""
     pace = run_pace_seconds(workout_type, threshold_pace)
+    cue = RUN_EFFORT_CUES.get(workout_type, "steady effort")
+
     if step_type in ("warmup", "cooldown", "rest"):
         # These already say what to do; the effort cue would just repeat it.
+        label = extra_note or step_type.title()
         note = f"{extra_note} @ {format_pace(pace)}" if extra_note else format_pace(pace)
     else:
-        cue = RUN_EFFORT_CUES.get(workout_type, "steady effort")
+        label = extra_note or cue
         note = (f"{extra_note} @ {format_pace(pace)} — {cue}" if extra_note
                 else f"{format_pace(pace)} — {cue}")
+
     return {
         "type": step_type,
         "duration": duration_secs,
         "pace": pace,
         "pace_pct": round(RUN_SPEED_FRACTIONS.get(workout_type, 0.78), 2),
+        # The pace is carried as a structured target, so the step name on the
+        # watch is the coaching cue rather than a repeat of the number.
+        "label": label,
         "notes": note,
     }
 
@@ -1057,18 +1230,28 @@ def _swim_metres(minutes: float, pace: str = "endurance") -> int:
 
 def _build_swim_steps(workout_type: str, duration: int, variation_seed: int = 0,
                       css_pace: int = 105) -> list[dict]:
+    """Swim sets are prescribed in metres.
+
+    Every step carries an explicit distance. Sending time plus a pace target
+    instead makes the consumer derive the distance itself, and intervals.icu
+    derived a 16km, six-hour recovery swim from a 35-minute one.
+    """
     warmup_mins = min(10, max(5, duration // 6))
     cooldown_mins = min(5, max(3, duration // 10))
     drill_mins = min(8, max(3, duration // 8))
     main_mins = duration - warmup_mins - cooldown_mins - drill_mins
 
     drill = SWIM_DRILLS[variation_seed % len(SWIM_DRILLS)]
+    warmup_m = _swim_metres(warmup_mins)
+    cooldown_m = _swim_metres(cooldown_mins, "recovery")
+    drill_m = _swim_metres(drill_mins, "recovery")
 
     steps = [
-        {"type": "warmup", "duration": warmup_mins * 60,
-         "notes": f"{_swim_metres(warmup_mins)}m easy freestyle, mix in backstroke"},
-        {"type": "steady", "duration": drill_mins * 60,
-         "notes": f"Technique: {drill} — focus on form, not speed"},
+        {"type": "warmup", "duration": warmup_mins * 60, "distance_m": warmup_m,
+         "pace": swim_pace_seconds("endurance", css_pace),
+         "notes": f"{warmup_m}m easy freestyle, mix in backstroke"},
+        {"type": "steady", "duration": drill_mins * 60, "distance_m": drill_m,
+         "notes": f"Technique: {drill} — {drill_m}m of drill work, form over speed"},
     ]
 
     if workout_type in ("threshold", "vo2max", "sweetspot", "tempo"):
@@ -1077,90 +1260,203 @@ def _build_swim_steps(workout_type: str, duration: int, variation_seed: int = 0,
         rep_secs = int(round(pace_per_100 * main_set["dist"] / 100 / 5) * 5)
         reps = max(2, (main_mins * 60) // (rep_secs + main_set["rest_sec"]))
         steps.append({
-            "type": "interval", "duration": rep_secs, "repeat": reps,
+            "type": "interval",
+            "duration": rep_secs,
+            "distance_m": main_set["dist"],
+            "repeat": reps,
             "pace": pace_per_100,
-            "rest": {"type": "rest", "duration": main_set["rest_sec"]},
+            "rest": {"type": "rest", "duration": main_set["rest_sec"],
+                     "notes": f"{main_set['rest_sec']}s rest"},
             "notes": f"{reps}x{main_set['dist']}m @ {format_swim_pace(pace_per_100)} "
                      f"({main_set['label']}), {main_set['rest_sec']}s rest",
         })
     else:
+        main_m = _swim_metres(main_mins)
         steps.append({
-            "type": "steady", "duration": main_mins * 60,
-            "notes": f"Continuous swim — {_swim_metres(main_mins)}m at easy, relaxed pace",
+            "type": "steady", "duration": main_mins * 60, "distance_m": main_m,
+            "pace": swim_pace_seconds("endurance", css_pace),
+            "notes": f"Continuous swim — {main_m}m at easy, relaxed pace",
         })
 
     steps.append({
-        "type": "cooldown", "duration": cooldown_mins * 60,
-        "notes": f"{_swim_metres(cooldown_mins, 'recovery')}m easy choice stroke, "
-                 "focus on long glide",
+        "type": "cooldown", "duration": cooldown_mins * 60, "distance_m": cooldown_m,
+        "notes": f"{cooldown_m}m easy choice stroke, focus on long glide",
     })
     return steps
 
 
-STRENGTH_EXERCISES = [
-    [
-        {"name": "Squat", "sets": 3, "reps": "8-10"},
-        {"name": "Romanian Deadlift", "sets": 3, "reps": "8-10"},
-        {"name": "Step-ups", "sets": 2, "reps": "10 each"},
-        {"name": "Plank", "sets": 3, "reps": "30-45s"},
-        {"name": "Single-leg Calf Raise", "sets": 2, "reps": "12 each"},
-    ],
-    [
-        {"name": "Bulgarian Split Squat", "sets": 3, "reps": "8 each"},
-        {"name": "Hip Thrust", "sets": 3, "reps": "10-12"},
-        {"name": "Single-leg Deadlift", "sets": 2, "reps": "8 each"},
-        {"name": "Side Plank", "sets": 2, "reps": "30s each"},
-        {"name": "Calf Raise", "sets": 3, "reps": "15"},
-    ],
-    [
-        {"name": "Goblet Squat", "sets": 3, "reps": "10-12"},
-        {"name": "Glute Bridge", "sets": 3, "reps": "12-15"},
-        {"name": "Lunges", "sets": 2, "reps": "10 each"},
-        {"name": "Dead Bug", "sets": 3, "reps": "10 each"},
-        {"name": "Band Walk", "sets": 2, "reps": "12 each"},
-    ],
+STRENGTH_BLOCKS = [
+    {
+        "name": "Max Strength — Bilateral",
+        "focus": "Heavy compound work for force production. Leave 2-3 reps in reserve.",
+        "exercises": [
+            {"name": "Back Squat", "sets": 4, "reps": 5, "category": 28, "rest": 120,
+             "cue": "Heavy but controlled — stop 2 reps short of failure"},
+            {"name": "Romanian Deadlift", "sets": 3, "reps": 6, "category": 8, "rest": 90,
+             "cue": "Hinge at the hip, feel the hamstrings load"},
+            {"name": "Weighted Step-up", "sets": 3, "reps": 8, "category": 17, "rest": 75,
+             "per_side": True, "cue": "Drive through the heel, no push off the back foot"},
+            {"name": "Standing Calf Raise", "sets": 3, "reps": 12, "category": 1, "rest": 45,
+             "cue": "Full range, slow lowering"},
+            {"name": "Pallof Press", "sets": 3, "reps": 10, "category": 5, "rest": 45,
+             "per_side": True, "cue": "Resist the rotation, ribs down"},
+        ],
+    },
+    {
+        "name": "Single-Leg & Posterior Chain",
+        "focus": "Unilateral strength and hip stability — where running durability comes from.",
+        "exercises": [
+            {"name": "Bulgarian Split Squat", "sets": 3, "reps": 8, "category": 17, "rest": 90,
+             "per_side": True, "cue": "Front shin vertical, torso tall"},
+            {"name": "Barbell Hip Thrust", "sets": 4, "reps": 8, "category": 10, "rest": 90,
+             "cue": "Squeeze at the top, chin tucked"},
+            {"name": "Single-leg Deadlift", "sets": 3, "reps": 8, "category": 8, "rest": 75,
+             "per_side": True, "cue": "Hips square, slow and balanced"},
+            {"name": "Copenhagen Plank", "sets": 3, "reps": 20, "category": 19, "rest": 45,
+             "per_side": True, "cue": "Adductor work — count seconds as reps"},
+            {"name": "Single-leg Calf Raise", "sets": 3, "reps": 12, "category": 1, "rest": 45,
+             "per_side": True, "cue": "Full extension, controlled down"},
+        ],
+    },
+    {
+        "name": "Power & Trunk",
+        "focus": "Rate of force development plus trunk stiffness for efficient running.",
+        "exercises": [
+            {"name": "Trap Bar Deadlift", "sets": 4, "reps": 4, "category": 8, "rest": 120,
+             "cue": "Move the bar fast — speed is the point, not grinding"},
+            {"name": "Box Jump", "sets": 4, "reps": 5, "category": 20, "rest": 90,
+             "cue": "Step down, never jump down"},
+            {"name": "Walking Lunge", "sets": 3, "reps": 10, "category": 17, "rest": 75,
+             "per_side": True, "cue": "Long stride, controlled knee"},
+            {"name": "Suitcase Carry", "sets": 3, "reps": 30, "category": 3, "rest": 60,
+             "per_side": True, "cue": "Heavy, stay square — count seconds as reps"},
+            {"name": "Dead Bug", "sets": 3, "reps": 10, "category": 5, "rest": 45,
+             "per_side": True, "cue": "Lower back stays flat on the floor"},
+        ],
+    },
+    {
+        "name": "Maintenance Circuit",
+        "focus": "In-season upkeep. Moderate load, nothing that leaves you sore for key sessions.",
+        "exercises": [
+            {"name": "Goblet Squat", "sets": 3, "reps": 10, "category": 28, "rest": 60,
+             "cue": "Upright chest, sit between the hips"},
+            {"name": "Glute Bridge", "sets": 3, "reps": 12, "category": 10, "rest": 45,
+             "cue": "Drive through the heels"},
+            {"name": "Single-arm Row", "sets": 3, "reps": 10, "category": 23, "rest": 60,
+             "per_side": True, "cue": "Pull to the hip, no shrug"},
+            {"name": "Push-up", "sets": 3, "reps": 12, "category": 22, "rest": 45,
+             "cue": "Full range, body in one line"},
+            {"name": "Side Plank", "sets": 2, "reps": 30, "category": 19, "rest": 45,
+             "per_side": True, "cue": "Count seconds as reps, hips high"},
+        ],
+    },
 ]
 
-
-def _build_strength_steps(duration: int, variation_seed: int = 0) -> list[dict]:
-    exercises = STRENGTH_EXERCISES[variation_seed % len(STRENGTH_EXERCISES)]
-    warmup_mins = 5
-    main_mins = duration - warmup_mins
-
-    steps = [
-        {"type": "warmup", "duration": warmup_mins * 60,
-         "notes": "Dynamic stretching: leg swings, hip circles, bodyweight squats"},
-    ]
-
-    per_exercise = max(3, main_mins // len(exercises))
-    for ex in exercises:
-        steps.append({
-            "type": "steady", "duration": per_exercise * 60,
-            "notes": f"{ex['name']}: {ex['sets']}x{ex['reps']}",
-        })
-
-    return steps
+# Roughly how long one rep takes, used only to estimate session length.
+SECONDS_PER_REP = 4
 
 
 def _pick_strength_days(slots: list[dict],
                         max_sessions: int = MAX_STRENGTH_SESSIONS) -> set[str]:
     """Strength rides along with easy days, never the day before a key run."""
-    by_day = {s["day"]: s for s in slots}
+    by_day: dict[str, list[dict]] = {}
+    for slot in slots:
+        by_day.setdefault(slot["day"], []).append(slot)
+
     chosen: list[str] = []
     for slot in slots:
         if slot["archetype"] != "easy" or not slot["duration"]:
             continue
-        idx = DAY_ORDER.index(slot["day"])
-        next_slot = by_day.get(DAY_ORDER[(idx + 1) % 7])
-        if (next_slot and next_slot["sport"] == "running"
-                and next_slot["archetype"] in ("quality", "long")):
+        index = DAY_ORDER.index(slot["day"])
+        next_day = by_day.get(DAY_ORDER[(index + 1) % 7], [])
+        if any(s["sport"] == "running" and s["archetype"] in ("quality", "long")
+               for s in next_day):
             continue
-        if chosen and idx - DAY_ORDER.index(chosen[-1]) < 2:
+        if chosen and index - DAY_ORDER.index(chosen[-1]) < 2:
             continue
         chosen.append(slot["day"])
         if len(chosen) >= max_sessions:
             break
     return set(chosen)
+
+
+def _build_strength_session(seed: int) -> dict:
+    block = _strength_block(seed)
+    steps = _build_strength_steps(0, seed)
+    duration = estimate_strength_minutes(block)
+    return {
+        "name": block["name"],
+        "sport": "strength",
+        "workout_type": "strength",
+        "archetype": "supporting",
+        "duration_minutes": duration,
+        "description": block["focus"],
+        "coach_notes": "",
+        "target_zone": "Strength work",
+        "tss_estimate": round(duration * 0.8),
+        "intensity_factor": IF_TABLE["strength"],
+        "priority": "supporting",
+        "distance_km": 0,
+        "steps": steps,
+    }
+
+
+def _strength_block(variation_seed: int = 0) -> dict:
+    return STRENGTH_BLOCKS[variation_seed % len(STRENGTH_BLOCKS)]
+
+
+def estimate_strength_minutes(block: dict) -> int:
+    """Time the prescribed sets actually take, rather than a fixed guess."""
+    seconds = 0
+    for exercise in block["exercises"]:
+        sides = 2 if exercise.get("per_side") else 1
+        work = exercise["reps"] * SECONDS_PER_REP * sides
+        seconds += exercise["sets"] * (work + exercise["rest"])
+    return round(seconds / 60)
+
+
+def _build_strength_steps(duration: int, variation_seed: int = 0) -> list[dict]:
+    """Strength as sets and reps, not a stopwatch.
+
+    A watch step of "Bulgarian Split Squat, 5:00 steady" is not how anyone
+    lifts. FIT has a rep-based duration type and an exercise taxonomy, so each
+    set is prescribed as reps and each rest as time, wrapped in a repeat for
+    the set count.
+    """
+    block = _strength_block(variation_seed)
+
+    steps: list[dict] = [{
+        "type": "warmup", "duration": 300, "exercise_category": 31,
+        "notes": "Dynamic warmup: leg swings, hip circles, bodyweight squats",
+    }]
+
+    for exercise in block["exercises"]:
+        sides = " each side" if exercise.get("per_side") else ""
+        steps.append({
+            "type": "interval",
+            "reps": exercise["reps"],
+            "sets": exercise["sets"],
+            "repeat": exercise["sets"],
+            "exercise": exercise["name"],
+            "exercise_category": exercise["category"],
+            "per_side": bool(exercise.get("per_side")),
+            # `notes` is what a watch shows on the step, so it repeats the
+            # scheme. The UI has those as fields already and shows `cue`.
+            "cue": exercise["cue"],
+            "notes": (f"{exercise['sets']}x{exercise['reps']}{sides} — "
+                      f"{exercise['cue']}"),
+            "rest": {
+                "type": "rest",
+                "duration": exercise["rest"],
+                "notes": f"Rest {exercise['rest']}s",
+            },
+        })
+
+    steps.append({
+        "type": "cooldown", "duration": 180,
+        "notes": "Stretch hip flexors, quads and calves",
+    })
+    return steps
 
 
 SWIM_ZONE_LABELS = {
@@ -1177,7 +1473,7 @@ def _target_zone(sport: str, workout_type: str, threshold_pace: int = 300,
                  css_pace: int = 105) -> str:
     """Zone label in the units the sport actually uses.
 
-    Cycling gets watts, running gets a pace, swimming gets a pace per 100m.
+    Cycling gets watts, running a pace per km, swimming a pace per 100m.
     """
     if sport == "strength":
         return "Strength work"
@@ -1223,25 +1519,6 @@ def _build_session(slot: dict, ftp: int, has_trainer: bool, seed: int,
         "steps": _build_workout_steps(workout_type, duration, ftp, has_trainer,
                                       seed, sport=sport,
                                       threshold_pace=threshold_pace, css_pace=css_pace),
-    }
-
-
-def _build_strength_session(seed: int) -> dict:
-    duration = STRENGTH_SESSION_MINUTES
-    return {
-        "name": "Strength Session",
-        "sport": "strength",
-        "workout_type": "strength",
-        "archetype": "supporting",
-        "duration_minutes": duration,
-        "description": "",
-        "coach_notes": "",
-        "target_zone": "Strength work",
-        "tss_estimate": 25,
-        "intensity_factor": IF_TABLE["strength"],
-        "priority": "supporting",
-        "distance_km": 0,
-        "steps": _build_strength_steps(duration, seed),
     }
 
 
@@ -1326,12 +1603,18 @@ def validate_plan(plan: dict, profile: dict) -> list[str]:
 def build_plan(profile: dict, ftp: int,
                fitness_context: dict | None = None,
                start_date: str = "",
-               threshold_pace: int = 300, css_pace: int = 105) -> dict:
+               threshold_pace: int = 300, css_pace: int = 105,
+               first_week_from: str = "") -> dict:
     """Build a training plan using constraint-based optimization.
 
     Computes the training envelope (duration targets, quality slots,
     sport distribution, recovery weeks) and fills in default workouts.
     The AI coach can then override workout design with coaching intelligence.
+
+    `first_week_from` starts a block mid-week: days before that date carry no
+    sessions and week one's budget shrinks to the days that are actually left,
+    so a Thursday start is a three-day week rather than seven days of training
+    squeezed into three.
     """
     experience = profile.get("experience_level", "intermediate")
     total_weeks = profile.get("plan_duration_weeks", 8)
@@ -1355,7 +1638,10 @@ def build_plan(profile: dict, ftp: int,
     # block ends with three consecutive easy weeks and the athlete detrains.
     if profile.get("goal_event") and total_weeks > 4:
         week_types[-1] = "taper"
-        if total_weeks >= 6 and "recovery" not in week_types[-3:-1]:
+        # Only add a pre-race cutback if the regular cycle has not put one in
+        # the run-in already — otherwise the block ends recovery, one build
+        # week, recovery, taper, which is mostly rest.
+        if total_weeks >= 6 and "recovery" not in week_types[-4:-1]:
             week_types[-2] = "recovery"
 
     rest_days = set(d.lower() for d in preferred_rest_days) if preferred_rest_days else set()
@@ -1366,18 +1652,32 @@ def build_plan(profile: dict, ftp: int,
     easy_days = [d for d in training_days if d not in quality_days]
 
     primary_sport = profile.get("primary_sport") or EVENT_PRIMARY_SPORT.get(event)
-    sport_schedule = _build_sport_schedule(sports, quality_days, easy_days, primary_sport)
+    real_sports = [s for s in sports if s != "strength"] or ["cycling"]
+    # Hard constraints the athlete gave us: pool days, an injured knee capping
+    # run frequency. These bound the planner rather than nudging it.
+    sport_limits = profile.get("sport_limits") or {}
 
-    # If the athlete told us what they are training now, start there rather than
-    # at a guess — ramping from their actual current load is the whole point.
-    current_hours = profile.get("current_weekly_hours")
+    # Where the ramp starts. Synced history beats the onboarding slider, and an
+    # explicit answer from the athlete beats both.
+    current_hours, volume_source = _resolve_starting_volume(profile)
     start_fraction = (
         current_hours / weekly_hours
         if current_hours and weekly_hours > 0 else None
     )
+
+    readiness = compute_readiness(fitness_context)
+    if start_fraction is not None:
+        start_fraction *= readiness["multiplier"]
+
     week_multipliers = compute_volume_progression(week_types, experience, start_fraction)
     progression = _assess_progression(week_multipliers, week_types, weekly_hours,
                                       current_hours, experience)
+    progression["volume_source"] = volume_source
+    if current_hours:
+        progression["current_hours"] = round(current_hours, 1)
+    if readiness.get("note"):
+        progression["readiness_note"] = readiness["note"]
+    progression["readiness"] = readiness["state"]
 
     weeks = []
     for week_idx in range(total_weeks):
@@ -1391,19 +1691,65 @@ def build_plan(profile: dict, ftp: int,
         elif week_type == "taper":
             week_quality = 1
 
+        # A block can start mid-week; the days already gone carry no sessions
+        # and the week's budget shrinks to match what is left.
+        week_training_days = training_days
+        week_easy_days = easy_days
         week_quality_days = quality_days[:week_quality]
-        base_slots = _assign_archetypes(
-            sport_schedule, training_days, week_quality_days,
-            capacity["long_session_essential"],
-        )
-        week_minutes = weekly_hours * 60 * week_multipliers[week_idx]
+        partial_factor = 1.0
+
+        if first_week_from and week_idx == 0:
+            cutoff = datetime.strptime(first_week_from, "%Y-%m-%d")
+            still_ahead = {
+                day for i, day in enumerate(DAY_ORDER)
+                if week_date + timedelta(days=i) >= cutoff
+            }
+            week_training_days = [d for d in training_days if d in still_ahead]
+            week_easy_days = [d for d in easy_days if d in still_ahead]
+            week_quality_days = [d for d in week_quality_days if d in still_ahead]
+            if training_days:
+                partial_factor = len(week_training_days) / len(training_days)
+
+        week_minutes = weekly_hours * 60 * week_multipliers[week_idx] * partial_factor
         # Strength costs the athlete time like anything else, so it comes out of
-        # the weekly budget rather than being bolted on top of it.
-        week_minutes -= STRENGTH_SESSION_MINUTES * MAX_STRENGTH_SESSIONS if "strength" in sports else 0
-        slots, unfitted = _allocate_slot_durations(base_slots, week_minutes, week_type)
-        slots, unfitted = _add_second_sessions(
-            slots, unfitted, sports, week_quality_days, max_sessions_per_day,
+        # the weekly budget rather than being bolted on top of it. Reserve what
+        # the prescribed sets actually take, not a flat guess — the blocks vary
+        # from about half an hour to three quarters.
+        strength_seeds = (
+            [week_num + n for n in range(MAX_STRENGTH_SESSIONS)]
+            if "strength" in sports else []
         )
+        strength_cost = sum(
+            estimate_strength_minutes(_strength_block(seed)) for seed in strength_seeds
+        )
+        # Never let supporting work claim more than a fifth of the week.
+        week_minutes -= min(strength_cost, week_minutes * 0.20)
+
+        # Frequency follows this week's volume, not the plan's headline hours.
+        # An early ramp week is a smaller week and should carry fewer sessions
+        # rather than the same number squeezed under their useful minimum.
+        if not week_training_days:
+            weeks.append({
+                "week_number": week_num, "week_type": week_type,
+                "focus": "Block starts later this week",
+                "target_hours": 0, "target_tss": 0, "distance_km": {},
+                "days": [_rest_day(d, week_date + timedelta(days=i))
+                         for i, d in enumerate(DAY_ORDER)],
+            })
+            continue
+
+        session_target = compute_session_target(
+            week_minutes / 60, len(real_sports), len(week_training_days),
+            max_sessions_per_day,
+        )
+        sport_schedule = _build_sport_schedule(
+            sports, week_quality_days, week_easy_days, primary_sport,
+            session_target, max_sessions_per_day, sport_limits,
+        )
+        base_slots = _assign_archetypes(
+            sport_schedule, week_quality_days, capacity["long_session_essential"],
+        )
+        slots, unfitted = _allocate_slot_durations(base_slots, week_minutes, week_type)
 
         quality_types = _pick_quality_types(week_quality, week_num)
         for idx, slot in enumerate(s for s in slots if s["archetype"] == "quality"):
@@ -1419,6 +1765,7 @@ def build_plan(profile: dict, ftp: int,
         days = []
         total_tss = 0.0
         total_distance: dict[str, float] = {}
+        strength_index = 0
 
         for i, day_name in enumerate(DAY_ORDER):
             day_date = week_date + timedelta(days=i)
@@ -1439,7 +1786,9 @@ def build_plan(profile: dict, ftp: int,
                 day_workouts.append(workout)
 
             if day_name in strength_days:
-                strength = _build_strength_session(week_num + i)
+                seed = strength_seeds[strength_index % len(strength_seeds)]
+                strength_index += 1
+                strength = _build_strength_session(seed)
                 day_workouts.append(strength)
                 total_tss += strength["tss_estimate"]
 

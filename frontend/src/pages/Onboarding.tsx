@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
 import {
   Zap, ChevronRight, ChevronLeft, Loader2,
@@ -75,6 +75,26 @@ export default function Onboarding() {
     notes: '',
   })
 
+  // Editing an existing profile should start from what is already saved —
+  // otherwise "Update Profile" quietly discards it and asks for all six steps
+  // again.
+  const { data: saved } = useQuery({ queryKey: ['profile'], queryFn: () => api.profile() })
+  const seeded = useRef(false)
+
+  useEffect(() => {
+    if (!saved || seeded.current) return
+    seeded.current = true
+    setProfile((current) => {
+      const merged: any = { ...current }
+      for (const [key, value] of Object.entries(saved)) {
+        if (key in merged && value !== null && value !== undefined && value !== '') {
+          merged[key] = value
+        }
+      }
+      return merged
+    })
+  }, [saved])
+
   const saveProfile = useMutation({
     mutationFn: () => api.updateProfile({ ...profile, onboarding_complete: true }),
     onSuccess: () => {
@@ -82,8 +102,11 @@ export default function Onboarding() {
     },
   })
 
+  const [elapsed, setElapsed] = useState(0)
+  const [planStart, setPlanStart] = useState<'this_week' | 'next_week'>('next_week')
+
   const generatePlan = useMutation({
-    mutationFn: () => api.generateFullPlan(),
+    mutationFn: () => api.generateFullPlanAndWait(setElapsed, planStart),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['plan'] })
       navigate('/plan')
@@ -173,6 +196,8 @@ export default function Onboarding() {
               <StepReview
                 profile={profile}
                 update={update}
+                planStart={planStart}
+                setPlanStart={setPlanStart}
                 isGenerating={generatePlan.isPending || saveProfile.isPending}
               />
             )}
@@ -203,7 +228,10 @@ export default function Onboarding() {
                 className="flex items-center gap-2 px-5 py-2 text-sm bg-accent hover:bg-accent-hover text-bg-primary rounded-lg disabled:opacity-50 transition-colors"
               >
                 {generatePlan.isPending || saveProfile.isPending ? (
-                  <><Loader2 className="w-4 h-4 animate-spin" /> Generating Plan...</>
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Generating Plan{elapsed ? ` — ${elapsed}s` : '...'}
+                  </>
                 ) : (
                   <><Zap className="w-4 h-4" /> Generate Plan</>
                 )}
@@ -211,9 +239,16 @@ export default function Onboarding() {
             )}
           </div>
 
+          {generatePlan.isPending && (
+            <p className="text-xs text-slate-500 mt-2 text-center">
+              Writing every session of your block — this takes a few minutes.
+              You can leave this page; the plan keeps building on the server.
+            </p>
+          )}
+
           {generatePlan.isError && (
             <p className="text-xs text-danger mt-2 text-center">
-              Plan generation failed. Check AI settings.
+              {(generatePlan.error as Error).message}
             </p>
           )}
         </div>
@@ -616,7 +651,7 @@ function labelsFor(values: string[], items: { value: string; label: string }[]):
   return values.map((v) => labelFor(v, items)).join(', ') || 'None specified'
 }
 
-function StepReview({ profile, isGenerating }: any) {
+function StepReview({ profile, isGenerating, planStart, setPlanStart }: any) {
   const items = [
     { label: 'Experience', value: labelFor(profile.experience_level, EXPERIENCE_LEVELS) },
     { label: 'Sports', value: labelsFor(profile.sports, SPORTS) },
@@ -643,6 +678,32 @@ function StepReview({ profile, isGenerating }: any) {
   return (
     <div className="space-y-4">
       <h2 className="text-lg font-semibold">Review Your Profile</h2>
+
+      <div>
+        <h3 className="text-sm font-medium mb-1">Start the plan</h3>
+        <p className="text-xs text-slate-500 mb-2">
+          Starting today gives a short first week — only the days that are left.
+        </p>
+        <div className="grid grid-cols-2 gap-2">
+          {[
+            { value: 'next_week', label: 'Next Monday', desc: 'A clean, full first week' },
+            { value: 'this_week', label: 'Today', desc: 'Train the rest of this week' },
+          ].map((option) => (
+            <button
+              key={option.value}
+              onClick={() => setPlanStart?.(option.value)}
+              className={`text-left px-3 py-2 rounded-xl border transition-colors ${
+                planStart === option.value
+                  ? 'border-accent/40 bg-accent/10'
+                  : 'border-white/5 bg-bg-tertiary hover:bg-bg-hover'
+              }`}
+            >
+              <span className="text-sm block">{option.label}</span>
+              <span className="text-[11px] text-slate-500">{option.desc}</span>
+            </button>
+          ))}
+        </div>
+      </div>
       <p className="text-xs text-slate-500">
         Confirm your settings. The AI coach will build a {profile.plan_duration_weeks}-week periodized plan
         tailored to your profile.

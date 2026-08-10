@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from ..models import Credential
 from ..config import settings
+from .fit_workout import generate_workout_fit, workout_filename
 import logging
 import base64
 
@@ -150,39 +151,77 @@ SPORT_TO_INTERVALS = {
 }
 
 
-def _to_icu_step(step: dict, sport: str) -> dict:
-    """Convert one plan step into an intervals.icu workout_doc step.
+def _describe_steps(workout: dict) -> str:
+    """Readable session text for the calendar entry."""
+    lines = []
+    for step in workout.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        minutes = round((step.get("duration") or 0) / 60)
+        repeat = step.get("repeat") or 1
+        label = step.get("notes") or step.get("type", "step")
+        if repeat > 1:
+            rest = step.get("rest") or {}
+            rest_min = round((rest.get("duration") or 0) / 60)
+            lines.append(f"{repeat}x {minutes}min — {label}"
+                         + (f" ({rest_min}min recovery)" if rest_min else ""))
+        else:
+            lines.append(f"{minutes}min — {label}")
 
-    Each sport is sent in the units its watch can actually follow: watts for
-    cycling, pace for running and swimming. Sending %FTP to a running watch
-    prescribes a target the athlete has no way to read.
+    parts = []
+    if workout.get("description"):
+        parts.append(workout["description"])
+    if workout.get("target_zone"):
+        parts.append(f"Target: {workout['target_zone']}")
+    if lines:
+        parts.append("\n".join(lines))
+    if workout.get("coach_notes"):
+        parts.append(f"Coach: {workout['coach_notes']}")
+    return "\n\n".join(parts)
+
+
+def _event_payload(workout: dict, date: str, ftp: int) -> dict:
+    """One intervals.icu calendar event, with the workout attached as FIT.
+
+    Planned sessions are calendar *events* with category WORKOUT — the
+    /workouts endpoint is the reusable workout library and never reaches the
+    athlete's calendar or their watch.
     """
-    icu: dict = {"type": step.get("type", "steady").capitalize()}
-    if step.get("duration"):
-        icu["duration"] = {"value": step["duration"], "units": "s"}
+    sport = workout.get("sport", "cycling")
+    duration = int(workout.get("duration_minutes") or 0) * 60
+    name = workout.get("name", "Pulse Workout")
 
-    if sport == "cycling":
-        if step.get("power") is not None:
-            icu["power"] = {"value": int(step["power"] * 100), "units": "%ftp"}
-            if step.get("power_end") is not None:
-                icu["powerEnd"] = {"value": int(step["power_end"] * 100), "units": "%ftp"}
-        if step.get("cadence"):
-            icu["cadence"] = {"value": step["cadence"], "units": "rpm"}
-    elif sport == "running" and step.get("pace"):
-        icu["pace"] = {"value": step["pace"], "units": "secs_per_km"}
-    elif sport == "swimming" and step.get("pace"):
-        icu["pace"] = {"value": step["pace"], "units": "secs_per_100m"}
+    payload = {
+        "category": "WORKOUT",
+        "start_date_local": f"{date}T00:00:00",
+        "type": SPORT_TO_INTERVALS.get(sport, "Ride"),
+        "name": name,
+        "description": _describe_steps(workout),
+        # Stable id so re-pushing the same session updates it instead of
+        # stacking duplicates on the calendar.
+        "external_id": f"pulse-{date}-{sport}-{abs(hash(name)) % 100000}",
+    }
+    if duration:
+        payload["moving_time"] = duration
 
-    if step.get("notes"):
-        icu["text"] = step["notes"]
-    return icu
+    if workout.get("steps"):
+        # intervals.icu reports "Unhandled duration_type: REPS" and silently
+        # drops those steps, so the pushed copy expresses sets as time. The
+        # downloadable file still uses reps, which watches do understand.
+        fit = generate_workout_fit(workout, ftp=ftp, rep_steps=False)
+        payload["filename"] = workout_filename(workout, date)
+        payload["file_contents_base64"] = base64.b64encode(fit).decode()
+
+    return payload
 
 
-async def push_workout(db: AsyncSession, workout_data: dict, date: str) -> dict:
-    """Push a structured workout to intervals.icu for watch sync (Coros/Garmin).
+async def push_workouts(db: AsyncSession, items: list[dict]) -> dict:
+    """Push planned sessions to the intervals.icu calendar.
 
-    Returns {"ok": True, "workout": ...} or {"ok": False, "error": "..."} —
-    the caller needs the reason to tell the athlete what to fix.
+    `items` is a list of {"workout": dict, "date": "YYYY-MM-DD"}. From there
+    intervals.icu forwards them to whichever device the athlete has connected
+    — Garmin, COROS, Wahoo, Polar or Suunto — which is why Pulse does not
+    need a partner API of its own.
     """
     creds = await _get_credentials(db)
     if not creds:
@@ -190,54 +229,41 @@ async def push_workout(db: AsyncSession, workout_data: dict, date: str) -> dict:
                 "No intervals.icu credentials. Add your API key and athlete ID in Settings."}
     api_key, athlete_id = creds
 
-    sport = workout_data.get("sport", "cycling")
-
-    icu_steps = []
-    for step in workout_data.get("steps", []):
-        if step.get("repeat") and step.get("rest"):
-            work = _to_icu_step(step, sport)
-            work["type"] = "Interval"
-            rest = _to_icu_step(step["rest"], sport)
-            rest["type"] = "Rest"
-            icu_steps.append({
-                "type": "Repeat",
-                "count": step["repeat"],
-                "steps": [work, rest],
-            })
-        else:
-            icu_steps.append(_to_icu_step(step, sport))
-
-    payload = {
-        "athlete_id": athlete_id,
-        "name": workout_data.get("name", "Pulse Workout"),
-        "description": workout_data.get("description", ""),
-        "type": SPORT_TO_INTERVALS.get(sport, "Ride"),
-        "date": date,
-        "moving_time": (workout_data.get("duration_minutes") or 0) * 60 or None,
-    }
-    if icu_steps:
-        payload["workout_doc"] = {"steps": icu_steps}
+    events = [
+        _event_payload(item["workout"], item["date"], settings.ftp)
+        for item in items
+        if item.get("workout", {}).get("workout_type") != "rest"
+    ]
+    if not events:
+        return {"ok": False, "error": "Nothing to push — no non-rest sessions selected."}
 
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                f"{INTERVALS_API}/athlete/{athlete_id}/workouts",
+                f"{INTERVALS_API}/athlete/{athlete_id}/events/bulk",
                 headers=_get_auth_headers(api_key),
-                json=payload,
-                timeout=30,
+                params={"upsert": "true"},
+                json=events,
+                timeout=60,
             )
     except httpx.HTTPError as exc:
-        log.error(f"intervals.icu workout push failed: {exc}")
+        log.error(f"intervals.icu push failed: {exc}")
         return {"ok": False, "error": f"Could not reach intervals.icu: {exc}"}
 
     if resp.status_code in (401, 403):
-        return {"ok": False, "error": "intervals.icu rejected the API key. Check it in Settings."}
+        return {"ok": False, "error":
+                "intervals.icu rejected the API key. Check it in Settings."}
     if resp.status_code not in (200, 201):
-        log.error(f"intervals.icu workout push failed [{resp.status_code}]: {resp.text}")
+        log.error(f"intervals.icu push failed [{resp.status_code}]: {resp.text[:300]}")
         return {"ok": False,
                 "error": f"intervals.icu returned {resp.status_code}: {resp.text[:200]}"}
 
-    return {"ok": True, "workout": resp.json()}
+    log.info(f"Pushed {len(events)} workout(s) to intervals.icu")
+    return {"ok": True, "pushed": len(events), "workout": resp.json()}
+
+
+async def push_workout(db: AsyncSession, workout_data: dict, date: str) -> dict:
+    return await push_workouts(db, [{"workout": workout_data, "date": date}])
 
 
 def parse_intervals_activity(raw: dict) -> dict:

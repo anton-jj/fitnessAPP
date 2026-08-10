@@ -166,9 +166,22 @@ the necessary training stimulus while remaining sustainable?"
     15h/wk -> still around 2-3 quality sessions
 - Higher-volume athletes mainly gain additional easy training, not more intervals.
 
+### Frequency Follows Volume
+Extra hours buy extra SESSIONS, not longer ones. Roughly, per discipline:
+    <5h/wk   -> 1 session
+    5-9h/wk  -> 2 sessions
+    9-14h/wk -> 3 sessions
+    14h+/wk  -> 4+ sessions
+When hours increase, add frequency to the low-stress disciplines first
+(swimming and cycling); running frequency grows last because it carries the
+most orthopedic cost. The envelope already reflects this — describe it, do
+not fight it.
+
 ### Sport-Specific Cost
 - Running: highest orthopedic stress. Increase cautiously. Protect key run sessions.
-- Cycling: lowest orthopedic stress. Primary method for increasing aerobic volume.
+- Cycling: lowest orthopedic stress. THE volume engine — for a multi-sport
+  athlete the bike should carry the largest share of weekly hours (roughly
+  45-60%), and it is where additional volume goes first as hours grow.
 - Swimming: technique-limited. Frequency > long sessions.
 - Strength: adds fatigue. Heavy lower-body should not interfere with key run workouts.
 
@@ -256,9 +269,12 @@ Steps are pushed to the athlete's watch, so they must be executable as written.
 - SWIMMING: no power. Set `pace` in SECONDS PER 100M against the athlete's CSS,
   and put the set in `notes` (e.g. "8x100m @ 1:45/100m, 15s rest"). Always
   include a technique/drill block. Never reference FTP or watts for a swim.
-- STRENGTH: no power. One step per exercise, with sets and reps in `notes`
-  (e.g. "Bulgarian Split Squat: 3x8 each leg"). Bias toward single-leg,
-  posterior chain and trunk work that supports the athlete's sports.
+- STRENGTH: no power and NO timed blocks. Each exercise is a step with `reps`
+  (repetitions per set) and `sets`, plus a `rest` step in seconds between sets.
+  Never prescribe an exercise as a duration — "Split Squat, 5 minutes" is not
+  how anyone lifts. Keep the envelope's exercises and set/rep scheme unless you
+  have a reason to change them; you may rewrite names, cues and coach notes.
+  Bias toward heavy-ish low-rep single-leg, posterior chain and trunk work.
 
 ## WHAT TO RETURN
 
@@ -312,7 +328,8 @@ async def generate_session(sport: str, session_type: str, duration_minutes: int,
 
 async def generate_structured_plan(profile: dict, ftp: int,
                                    fitness_context: dict | None = None,
-                                   start_date: str = "") -> dict | None:
+                                   start_date: str = "",
+                                   first_week_from: str = "") -> dict | None:
     """Generate a multi-week periodized plan.
 
     The plan builder computes the training envelope (duration targets,
@@ -324,7 +341,8 @@ async def generate_structured_plan(profile: dict, ftp: int,
     plan = build_plan(profile=profile, ftp=ftp,
                       fitness_context=fitness_context, start_date=start_date,
                       threshold_pace=settings.threshold_pace,
-                      css_pace=settings.swim_css_pace)
+                      css_pace=settings.swim_css_pace,
+                      first_week_from=first_week_from)
 
     strategy = await _generate(
         STRATEGY_PROMPT,
@@ -353,6 +371,7 @@ async def generate_structured_plan(profile: dict, ftp: int,
         async with semaphore:
             summary = _build_week_summary(
                 week, week_strategies.get(week["week_number"]), plan, profile, ftp,
+                fitness_context,
             )
             return week, await _generate(WEEK_PROMPT, summary, tier="heavy")
 
@@ -479,6 +498,17 @@ def _build_athlete_context(profile: dict, ftp: int,
         f"Weekly hours: {profile.get('weekly_hours', 8)}h",
     ]
 
+    history = profile.get("observed_history")
+    if history:
+        by_sport = ", ".join(
+            f"{sport} {hours}h" for sport, hours in history["hours_by_sport"].items()
+        )
+        lines.append(
+            f"ACTUALLY TRAINING (last {history['weeks_observed']} weeks of synced "
+            f"data): {history['weekly_hours']}h/week across "
+            f"{history['sessions_per_week']} sessions — {by_sport}"
+        )
+
     optional = [
         ("goal_event", "Target event"),
         ("goal_event_distance", "Event distance"),
@@ -545,6 +575,14 @@ def _build_strategy_summary(plan: dict, profile: dict, ftp: int,
             f"Ramps {prog['start_hours']}h -> {prog['peak_hours']}h/week over "
             f"{prog['build_weeks']} build weeks (+{prog['weekly_increase_pct']}%/build week)."
         )
+        source = {
+            "observed": "the athlete's actual synced training volume",
+            "stated": "what the athlete reported they are currently training",
+            "default": "a default, since there is no history to go on",
+        }.get(prog.get("volume_source", "default"))
+        lines.append(f"The starting point comes from {source}.")
+        if prog.get("readiness_note"):
+            lines.append(f"Readiness: {prog['readiness_note']}")
         if prog.get("note"):
             lines.append(f"Shortfall: {prog['note']}")
 
@@ -575,13 +613,14 @@ def _build_strategy_summary(plan: dict, profile: dict, ftp: int,
 
 
 def _build_week_summary(week: dict, week_strategy: dict | None, plan: dict,
-                        profile: dict, ftp: int) -> str:
+                        profile: dict, ftp: int,
+                        fitness_context: dict | None = None) -> str:
     """Envelope for a single week, plus the block strategy for it."""
     lines = [
         f"Plan: {plan['name']} — writing week {week['week_number']} "
         f"of {plan['total_weeks']}",
     ]
-    lines += _build_athlete_context(profile, ftp)
+    lines += _build_athlete_context(profile, ftp, fitness_context)
 
     if plan.get("progression_notes"):
         lines.append(f"\nBlock progression: {plan['progression_notes']}")

@@ -11,7 +11,18 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-COMPOSE_FILE=docker-compose.prod.yml
+# Use whichever compose file is here, so this drops into an existing
+# /opt/stacks/<app> layout without renaming anything.
+COMPOSE_FILE="${COMPOSE_FILE:-}"
+if [[ -z "$COMPOSE_FILE" ]]; then
+  for candidate in compose.yml compose.yaml docker-compose.prod.yml docker-compose.yml; do
+    if [[ -f "$candidate" ]]; then COMPOSE_FILE="$candidate"; break; fi
+  done
+fi
+if [[ -z "$COMPOSE_FILE" || ! -f "$COMPOSE_FILE" ]]; then
+  echo "error: no compose file found here." >&2
+  exit 1
+fi
 
 if [[ ! -f .env ]]; then
   echo "error: no .env here. Copy .env.example and fill it in." >&2

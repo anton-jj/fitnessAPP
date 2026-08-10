@@ -33,6 +33,7 @@ async def _migrate(conn):
     column_migrations = [
         ("athlete_profile", "max_sessions_per_day", "INTEGER DEFAULT 1"),
         ("athlete_profile", "current_weekly_hours", "FLOAT"),
+        ("athlete_profile", "sport_limits", "JSON"),
     ]
     for table, column, col_type in column_migrations:
         try:

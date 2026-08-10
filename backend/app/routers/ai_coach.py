@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm.attributes import flag_modified
@@ -9,8 +10,12 @@ from ..services.ai_coach import (
     generate_session, generate_structured_plan, adjust_plan, get_usage,
     get_last_error,
 )
-from ..services.intervals import push_workout
+from ..services.intervals import push_workout, push_workouts
 from ..config import settings
+from ..services.fit_workout import generate_workout_fit, workout_filename
+from ..services.ics_feed import plan_to_ics
+from ..services.compliance import plan_compliance, adapt_remaining_weeks
+import io
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 from typing import Optional
@@ -357,7 +362,123 @@ async def push_workout_to_watch(req: WorkoutPushRequest, db: AsyncSession = Depe
     result = await push_workout(db, req.workout, req.date)
     if not result.get("ok"):
         raise HTTPException(502, result.get("error", "Push to intervals.icu failed"))
-    return {"pushed": True, "intervals_response": result["workout"]}
+    return {"pushed": True, "count": result.get("pushed", 1)}
+
+
+class PlanPushRequest(BaseModel):
+    plan_id: int
+    week_number: Optional[int] = None  # omit to push the whole plan
+
+
+@router.post("/push-plan")
+async def push_plan_to_watch(req: PlanPushRequest, db: AsyncSession = Depends(get_db)):
+    """Push a whole week (or the whole block) in one go."""
+    result = await db.execute(select(TrainingPlan).where(TrainingPlan.id == req.plan_id))
+    plan = result.scalar_one_or_none()
+    if not plan or not plan.plan_data:
+        raise HTTPException(404, "Plan not found")
+
+    weeks = plan.plan_data.get("weeks") or [plan.plan_data]
+    if req.week_number is not None:
+        weeks = [w for w in weeks if w.get("week_number") == req.week_number]
+        if not weeks:
+            raise HTTPException(404, "Week not found")
+
+    items = [
+        {"workout": workout, "date": day["date"]}
+        for week in weeks
+        for day in week.get("days", [])
+        if day.get("date")
+        for workout in day.get("workouts", [])
+        if workout.get("workout_type") != "rest"
+    ]
+    if not items:
+        raise HTTPException(400, "Nothing to push")
+
+    pushed = await push_workouts(db, items)
+    if not pushed.get("ok"):
+        raise HTTPException(502, pushed.get("error", "Push to intervals.icu failed"))
+    return {"pushed": True, "count": pushed.get("pushed", len(items))}
+
+
+@router.post("/workout-file")
+async def download_workout_file(req: WorkoutPushRequest):
+    """Download one session as a .fit workout file.
+
+    Import it into Garmin Connect or the COROS app when you would rather not
+    route through intervals.icu, or have no connection set up at all.
+    """
+    fit = generate_workout_fit(req.workout, ftp=settings.ftp)
+    return StreamingResponse(
+        io.BytesIO(fit),
+        media_type="application/vnd.ant.fit",
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="{workout_filename(req.workout, req.date)}"'
+        },
+    )
+
+
+@router.get("/plan/{plan_id}/compliance")
+async def plan_compliance_report(plan_id: int, db: AsyncSession = Depends(get_db)):
+    """How the finished weeks actually went, and what to do about it."""
+    result = await db.execute(select(TrainingPlan).where(TrainingPlan.id == plan_id))
+    plan = result.scalar_one_or_none()
+    if not plan or not plan.plan_data:
+        raise HTTPException(404, "Plan not found")
+    return await plan_compliance(db, plan.plan_data)
+
+
+@router.post("/plan/{plan_id}/adapt")
+async def adapt_plan_to_compliance(plan_id: int, db: AsyncSession = Depends(get_db)):
+    """Apply the compliance recommendation to the weeks that have not started.
+
+    Deterministic — no model call, so adapting a block is free and instant
+    where regenerating one is neither.
+    """
+    result = await db.execute(select(TrainingPlan).where(TrainingPlan.id == plan_id))
+    plan = result.scalar_one_or_none()
+    if not plan or not plan.plan_data:
+        raise HTTPException(404, "Plan not found")
+
+    report = await plan_compliance(db, plan.plan_data)
+    recommendation = report["recommendation"]
+    if recommendation["action"] == "none":
+        return {"adapted": False, "reason": recommendation["reason"]}
+
+    plan.plan_data = adapt_remaining_weeks(
+        plan.plan_data, recommendation,
+        threshold_pace=settings.threshold_pace, css_pace=settings.swim_css_pace,
+    )
+    flag_modified(plan, "plan_data")
+    await db.commit()
+
+    adaptation = plan.plan_data["adaptation"]
+    if not adaptation["changed_now"]:
+        return {"adapted": False,
+                "reason": "The weeks ahead already match this recommendation."}
+    return {"adapted": True, **adaptation}
+
+
+@router.get("/plan/{plan_id}/calendar.ics")
+async def plan_calendar_feed(plan_id: int, db: AsyncSession = Depends(get_db)):
+    """Subscribe to the plan from any calendar app.
+
+    Served without auth on purpose — calendar clients cannot log in, and the
+    id is the only thing standing between a URL and the feed. Do not share it
+    more widely than you would share the plan itself.
+    """
+    result = await db.execute(select(TrainingPlan).where(TrainingPlan.id == plan_id))
+    plan = result.scalar_one_or_none()
+    if not plan or not plan.plan_data:
+        raise HTTPException(404, "Plan not found")
+
+    ics = plan_to_ics(plan.plan_data, plan.name or "Training Plan")
+    return Response(
+        content=ics,
+        media_type="text/calendar; charset=utf-8",
+        headers={"Content-Disposition": 'inline; filename="pulse-plan.ics"'},
+    )
 
 
 @router.get("/workouts", response_model=list[WorkoutOut])

@@ -1,13 +1,18 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from ..database import get_db
+from ..database import get_db, async_session
 from ..models import AthleteProfile, FitnessData, TrainingPlan
 from ..services.ai_coach import generate_structured_plan, get_last_error
+from ..services.training_history import recent_training_volume
 from ..config import settings
 from datetime import datetime, timedelta
+import asyncio
+import logging
 from pydantic import BaseModel
 from typing import Optional
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/profile", tags=["profile"])
 
@@ -30,6 +35,7 @@ class ProfileUpdate(BaseModel):
     has_power_meter: Optional[bool] = None
     has_hr_monitor: Optional[bool] = None
     max_sessions_per_day: Optional[int] = None
+    sport_limits: Optional[dict] = None
     auto_push: Optional[bool] = None
     notes: Optional[str] = None
     onboarding_complete: Optional[bool] = None
@@ -60,8 +66,82 @@ async def update_profile(data: ProfileUpdate, db: AsyncSession = Depends(get_db)
     return _serialize(profile)
 
 
+# Generating a block is minutes of model time. Holding an HTTP connection open
+# that long is fragile — proxies time out, phones sleep, tabs get closed — so
+# the request starts a job and the client polls for the result.
+_generation: dict = {"status": "idle", "error": None, "plan_id": None,
+                     "started_at": None, "finished_at": None, "detail": None}
+
+# asyncio only holds a weak reference to running tasks, so a fire-and-forget
+# task can be garbage collected mid-run. Keep a strong reference until it ends.
+_background_tasks: set = set()
+
+
+def _generation_state() -> dict:
+    return dict(_generation)
+
+
+async def _run_generation(profile_dict: dict, fitness_context: dict | None,
+                          start_date: str, first_week_from: str = "") -> None:
+    global _generation
+    try:
+        plan_result = await generate_structured_plan(
+            profile=profile_dict,
+            ftp=settings.ftp,
+            fitness_context=fitness_context,
+            start_date=start_date,
+            first_week_from=first_week_from,
+        )
+        if not plan_result:
+            raise RuntimeError(get_last_error() or "Plan generation failed")
+
+        async with async_session() as db:
+            existing = await db.execute(
+                select(TrainingPlan).where(TrainingPlan.status.in_(["active", "upcoming"]))
+            )
+            for old in existing.scalars().all():
+                old.status = "archived"
+
+            plan = TrainingPlan(
+                week=datetime.strptime(start_date, "%Y-%m-%d").strftime("%G-W%V"),
+                name=plan_result.get("name", "Training Plan"),
+                description=plan_result.get("description"),
+                plan_data=plan_result,
+                status="active",
+            )
+            db.add(plan)
+            await db.commit()
+            await db.refresh(plan)
+            plan_id = plan.id
+
+        _generation.update({
+            "status": "done", "plan_id": plan_id, "error": None,
+            "finished_at": datetime.utcnow().isoformat(),
+            "detail": f"{plan_result.get('total_weeks')} weeks",
+        })
+        log.info(f"Plan generation finished: plan {plan_id}")
+    except Exception as exc:
+        log.exception("Plan generation failed")
+        _generation.update({
+            "status": "error", "error": str(exc),
+            "finished_at": datetime.utcnow().isoformat(),
+        })
+
+
+class GeneratePlanRequest(BaseModel):
+    # "next_week" starts on the coming Monday; "this_week" starts today and
+    # runs the rest of the current week as a short first week.
+    start: str = "next_week"
+
+
 @router.post("/generate-plan")
-async def generate_full_plan(db: AsyncSession = Depends(get_db)):
+async def generate_full_plan(req: GeneratePlanRequest | None = None,
+                             db: AsyncSession = Depends(get_db)):
+    """Kick off generation and return immediately. Poll /generate-plan/status."""
+    if _generation["status"] == "running":
+        return {"status": "running", "started_at": _generation["started_at"],
+                "message": "A plan is already being generated"}
+
     result = await db.execute(select(AthleteProfile).limit(1))
     profile = result.scalar_one_or_none()
     if not profile or not profile.onboarding_complete:
@@ -79,49 +159,46 @@ async def generate_full_plan(db: AsyncSession = Depends(get_db)):
             "tsb": latest_fitness.tsb,
         }
 
+    # What the athlete has actually been training, so the ramp starts from
+    # reality rather than from whatever they set during onboarding.
+    observed = await recent_training_volume(db)
+
     today = datetime.utcnow()
-    days_until_monday = (7 - today.weekday()) % 7
-    if days_until_monday == 0:
-        days_until_monday = 7
-    start_date = (today + timedelta(days=days_until_monday)).strftime("%Y-%m-%d")
+    start_this_week = (req.start if req else "next_week") == "this_week"
+
+    if start_this_week:
+        # Anchor to this week's Monday so the calendar lines up, but start
+        # training today — the days already gone stay empty.
+        monday = today - timedelta(days=today.weekday())
+        start_date = monday.strftime("%Y-%m-%d")
+        first_week_from = today.strftime("%Y-%m-%d")
+    else:
+        days_until_monday = (7 - today.weekday()) % 7 or 7
+        start_date = (today + timedelta(days=days_until_monday)).strftime("%Y-%m-%d")
+        first_week_from = ""
 
     profile_dict = _serialize(profile)
-    plan_result = await generate_structured_plan(
-        profile=profile_dict,
-        ftp=settings.ftp,
-        fitness_context=fitness_context,
-        start_date=start_date,
-    )
-    if not plan_result:
-        detail = get_last_error() or "Plan generation failed"
-        raise HTTPException(500, f"Plan generation failed: {detail}")
+    if observed:
+        profile_dict["observed_weekly_hours"] = observed["weekly_hours"]
+        profile_dict["observed_history"] = observed
 
-    existing = await db.execute(
-        select(TrainingPlan).where(TrainingPlan.status.in_(["active", "upcoming"]))
+    _generation.update({
+        "status": "running", "error": None, "plan_id": None,
+        "started_at": datetime.utcnow().isoformat(), "finished_at": None,
+        "detail": f"{profile.plan_duration_weeks or 8} weeks, starting "
+                  + ("today" if start_this_week else start_date),
+    })
+    task = asyncio.create_task(
+        _run_generation(profile_dict, fitness_context, start_date, first_week_from)
     )
-    for old in existing.scalars().all():
-        old.status = "archived"
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return {"status": "running", "started_at": _generation["started_at"]}
 
-    weeks = plan_result.get("weeks", [])
-    plan = TrainingPlan(
-        week=datetime.strptime(start_date, "%Y-%m-%d").strftime("%G-W%V"),
-        name=plan_result.get("name", "Training Plan"),
-        description=plan_result.get("description"),
-        plan_data=plan_result,
-        status="active",
-    )
-    db.add(plan)
-    await db.commit()
-    await db.refresh(plan)
 
-    return {
-        "plan_id": plan.id,
-        "plan_name": plan_result.get("name"),
-        "total_weeks": plan_result.get("total_weeks"),
-        "description": plan_result.get("description"),
-        "weeks_created": len(weeks),
-        "progression_notes": plan_result.get("progression_notes"),
-    }
+@router.get("/generate-plan/status")
+async def generate_plan_status():
+    return _generation_state()
 
 
 def _serialize(profile: AthleteProfile) -> dict:
@@ -144,6 +221,7 @@ def _serialize(profile: AthleteProfile) -> dict:
         "has_power_meter": profile.has_power_meter,
         "has_hr_monitor": profile.has_hr_monitor,
         "max_sessions_per_day": profile.max_sessions_per_day or 1,
+        "sport_limits": profile.sport_limits or {},
         "auto_push": profile.auto_push,
         "notes": profile.notes,
         "onboarding_complete": profile.onboarding_complete,
