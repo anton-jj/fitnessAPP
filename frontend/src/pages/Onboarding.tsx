@@ -65,6 +65,7 @@ export default function Onboarding() {
     weekly_hours: 8,
     current_weekly_hours: null as number | null,
     max_sessions_per_day: 1,
+    sport_limits: {} as Record<string, any>,
     preferred_hard_days: ['tuesday', 'thursday', 'saturday'] as string[],
     preferred_rest_days: ['monday'] as string[],
     plan_duration_weeks: 8,
@@ -419,6 +420,119 @@ function StepWeaknesses({ profile, toggleList }: any) {
   )
 }
 
+const MAX_SESSIONS_PER_SPORT = 8
+
+/** Per-discipline weekly frequency. Left on Auto, the planner derives it from
+ *  volume; set, it becomes the number the plan is built around. */
+function SessionsPerSport({ profile, update }: any) {
+  const sports = SPORTS.filter(
+    (s) => s.value !== 'strength' && profile.sports.includes(s.value),
+  )
+  if (sports.length === 0) return null
+
+  const limits: Record<string, any> = profile.sport_limits || {}
+  const sessionsFor = (sport: string): number | null => limits[sport]?.sessions ?? null
+
+  const setSessions = (sport: string, value: number | null) => {
+    const entry = { ...(limits[sport] || {}) }
+    if (value === null) delete entry.sessions
+    else entry.sessions = value
+    const next = { ...limits, [sport]: entry }
+    // Drop the key entirely once nothing is set, so an untouched profile keeps
+    // sending {} and the planner stays on its own frequency model.
+    if (Object.keys(entry).length === 0) delete next[sport]
+    update('sport_limits', next)
+  }
+
+  const chosen = sports.filter((s) => sessionsFor(s.value) !== null)
+  const total = chosen.reduce((sum, s) => sum + (sessionsFor(s.value) || 0), 0)
+  const restDays = profile.preferred_rest_days?.length || 0
+  const capacity = (7 - restDays) * (profile.max_sessions_per_day || 1)
+  const overCapacity = chosen.length === sports.length && total > capacity
+
+  return (
+    <div>
+      <h2 className="text-sm font-medium mb-1 flex items-center gap-2">
+        Sessions Per Sport
+        <div className="group relative">
+          <Info className="w-3.5 h-3.5 text-slate-500 cursor-help" />
+          <div className="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 w-64 p-2.5 rounded-xl bg-bg-tertiary border border-white/10 text-xs text-slate-300 leading-relaxed opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity z-10">
+            Leave on Auto and frequency follows your volume. Set a number and the plan is built around it — extra hours make those sessions longer rather than adding more.
+          </div>
+        </div>
+      </h2>
+      <p className="text-xs text-slate-500 mb-3">
+        Know you want 6 rides and 3 runs? Set them here.
+      </p>
+
+      <div className="space-y-2">
+        {sports.map((sport) => {
+          const Icon = sport.icon
+          const value = sessionsFor(sport.value)
+          return (
+            <div
+              key={sport.value}
+              className="flex items-center gap-3 p-2.5 rounded-xl bg-bg-tertiary border border-white/5"
+            >
+              <Icon className="w-4 h-4 text-slate-400 shrink-0" />
+              <span className="text-sm flex-1 min-w-0 truncate">{sport.label}</span>
+              <div className="flex items-center gap-1 shrink-0">
+                <button
+                  onClick={() => setSessions(sport.value, null)}
+                  className={`px-2.5 py-1 text-[11px] rounded-lg transition-colors ${
+                    value === null
+                      ? 'bg-accent/20 text-accent border border-accent/30'
+                      : 'text-slate-500 border border-transparent hover:text-slate-300'
+                  }`}
+                >
+                  Auto
+                </button>
+                <button
+                  onClick={() => setSessions(sport.value, Math.max(1, (value ?? 1) - 1))}
+                  disabled={value !== null && value <= 1}
+                  className="w-7 h-7 rounded-lg bg-bg-hover text-slate-300 disabled:opacity-30 hover:text-white transition-colors"
+                  aria-label={`Fewer ${sport.label} sessions`}
+                >
+                  −
+                </button>
+                <span
+                  className={`w-6 text-center text-sm tabular-nums ${
+                    value === null ? 'text-slate-600' : 'font-medium'
+                  }`}
+                >
+                  {value ?? '–'}
+                </span>
+                <button
+                  onClick={() =>
+                    setSessions(sport.value, Math.min(MAX_SESSIONS_PER_SPORT, (value ?? 0) + 1))
+                  }
+                  disabled={value !== null && value >= MAX_SESSIONS_PER_SPORT}
+                  className="w-7 h-7 rounded-lg bg-bg-hover text-slate-300 disabled:opacity-30 hover:text-white transition-colors"
+                  aria-label={`More ${sport.label} sessions`}
+                >
+                  +
+                </button>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+
+      {chosen.length > 0 && (
+        <p className={`text-[11px] mt-2 ${overCapacity ? 'text-warning' : 'text-slate-500'}`}>
+          {overCapacity
+            ? `${total} sessions needs more room than ${7 - restDays} days at ${
+                profile.max_sessions_per_day
+              }/day (${capacity}). Raise sessions per day, or train on a rest day.`
+            : `${total} session${total === 1 ? '' : 's'} a week set${
+                chosen.length < sports.length ? `, ${sports.length - chosen.length} on Auto` : ''
+              }.`}
+        </p>
+      )}
+    </div>
+  )
+}
+
 function StepSchedule({ profile, update, toggleList }: any) {
   return (
     <div className="space-y-5">
@@ -480,27 +594,30 @@ function StepSchedule({ profile, update, toggleList }: any) {
             </div>
           </div>
         </h2>
-        <p className="text-xs text-slate-500 mb-2">Can you train twice in one day?</p>
+        <p className="text-xs text-slate-500 mb-2">How often can you train in one day?</p>
         <div className="flex gap-2">
           {[
-            { value: 1, label: '1 session', desc: 'Standard' },
-            { value: 2, label: '2 sessions', desc: 'AM + PM splits' },
+            { value: 1, label: '1', desc: 'Standard' },
+            { value: 2, label: '2', desc: 'AM + PM' },
+            { value: 3, label: '3', desc: 'High frequency' },
           ].map((opt) => (
             <button
               key={opt.value}
               onClick={() => update('max_sessions_per_day', opt.value)}
-              className={`flex-1 text-left p-3 rounded-xl transition-colors ${
+              className={`flex-1 min-w-0 text-left p-3 rounded-xl transition-colors ${
                 profile.max_sessions_per_day === opt.value
                   ? 'bg-accent/15 border border-accent/30'
                   : 'bg-bg-tertiary border border-white/5 hover:bg-bg-hover'
               }`}
             >
-              <div className="text-sm font-medium">{opt.label}</div>
-              <div className="text-[11px] text-slate-500">{opt.desc}</div>
+              <div className="text-sm font-medium">{opt.label}/day</div>
+              <div className="text-[11px] text-slate-500 truncate">{opt.desc}</div>
             </button>
           ))}
         </div>
       </div>
+
+      <SessionsPerSport profile={profile} update={update} />
 
       <div>
         <h2 className="text-sm font-medium mb-2">Hard Days</h2>
@@ -651,6 +768,14 @@ function labelsFor(values: string[], items: { value: string; label: string }[]):
   return values.map((v) => labelFor(v, items)).join(', ') || 'None specified'
 }
 
+/** "6 Cycling, 3 Running" for whichever disciplines were given a set count. */
+function statedSessions(profile: any): string {
+  const limits: Record<string, any> = profile.sport_limits || {}
+  return SPORTS.filter((s) => profile.sports.includes(s.value) && limits[s.value]?.sessions)
+    .map((s) => `${limits[s.value].sessions} ${s.label}`)
+    .join(', ')
+}
+
 function StepReview({ profile, isGenerating, planStart, setPlanStart }: any) {
   const items = [
     { label: 'Experience', value: labelFor(profile.experience_level, EXPERIENCE_LEVELS) },
@@ -663,7 +788,16 @@ function StepReview({ profile, isGenerating, planStart, setPlanStart }: any) {
       label: 'Training Now',
       value: `${profile.current_weekly_hours ?? profile.weekly_hours}h — plan ramps toward ${profile.weekly_hours}h`,
     },
-    { label: 'Sessions/Day', value: profile.max_sessions_per_day >= 2 ? 'Up to 2 (AM + PM)' : '1' },
+    {
+      label: 'Sessions/Day',
+      value: profile.max_sessions_per_day >= 2
+        ? `Up to ${profile.max_sessions_per_day}`
+        : '1',
+    },
+    {
+      label: 'Sessions/Sport',
+      value: statedSessions(profile) || 'Auto — set from your weekly hours',
+    },
     { label: 'Hard Days', value: profile.preferred_hard_days.map((d: string) => d.charAt(0).toUpperCase() + d.slice(1, 3)).join(', ') },
     { label: 'Rest Days', value: profile.preferred_rest_days.map((d: string) => d.charAt(0).toUpperCase() + d.slice(1, 3)).join(', ') },
     { label: 'Plan Duration', value: `${profile.plan_duration_weeks} weeks` },

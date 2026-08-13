@@ -1,10 +1,12 @@
 import { useState } from 'react'
 import { Outlet, NavLink } from 'react-router-dom'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   LayoutDashboard, Activity, CalendarDays, Heart,
   Brain, Bike, Settings as SettingsIcon, Zap,
-  ClipboardList, Plus, ListChecks,
+  ClipboardList, Plus, ListChecks, Lock,
 } from 'lucide-react'
+import { api } from '../api/client'
 import LogActivityModal from './LogActivityModal'
 
 const nav = [
@@ -18,6 +20,31 @@ const nav = [
   { to: '/trainer', icon: Bike, label: 'Trainer' },
   { to: '/settings', icon: SettingsIcon, label: 'Settings' },
 ]
+
+/** Sign out. Renders only when the server is actually asking for a PIN —
+ *  an instance with no PIN set has nothing to lock. */
+function LockButton() {
+  const { data: session } = useQuery({ queryKey: ['session'], queryFn: () => api.session() })
+
+  const logout = useMutation({
+    mutationFn: () => api.logout(),
+    // Reload for the same reason as login, and it guarantees no fetched
+    // training data is left sitting in memory behind the lock screen.
+    onSuccess: () => window.location.reload(),
+  })
+
+  if (!session?.required) return null
+
+  return (
+    <button
+      onClick={() => logout.mutate()}
+      className="mx-3 mb-3 flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-slate-500 hover:text-slate-300 hover:bg-bg-hover transition-colors"
+    >
+      <Lock className="w-[18px] h-[18px]" />
+      Lock
+    </button>
+  )
+}
 
 export default function Layout() {
   const [logOpen, setLogOpen] = useState(false)
@@ -57,6 +84,8 @@ export default function Layout() {
             </NavLink>
           ))}
         </nav>
+
+        <LockButton />
       </aside>
 
       {/* Main content */}

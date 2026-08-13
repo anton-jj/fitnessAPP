@@ -1,13 +1,72 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import BaseModel
 from ..database import get_db
 from ..services import strava
+from ..services import session_auth
 from ..models import Credential
 from ..config import settings
 from sqlalchemy import select
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+
+class PinLogin(BaseModel):
+    pin: str
+
+
+def _client_id(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+@router.get("/session")
+async def session_status(request: Request):
+    """Whether this browser is signed in, and whether it even needs to be."""
+    if not session_auth.is_enabled():
+        return {"required": False, "authenticated": True}
+    token = request.cookies.get(session_auth.COOKIE_NAME)
+    return {
+        "required": True,
+        "authenticated": session_auth.verify_token(token),
+    }
+
+
+@router.post("/login")
+async def login(body: PinLogin, request: Request, response: Response):
+    if not session_auth.is_enabled():
+        return {"authenticated": True, "required": False}
+
+    client = _client_id(request)
+    wait = session_auth.seconds_until_unlocked(client)
+    if wait:
+        raise HTTPException(
+            429, f"Too many attempts. Try again in {wait // 60 + 1} minute(s)."
+        )
+
+    if not session_auth.check_pin(body.pin, client):
+        raise HTTPException(401, "Incorrect PIN")
+
+    # Secure only over HTTPS — set unconditionally it would break a plain-HTTP
+    # LAN or tailnet instance, where the cookie would be dropped silently.
+    forwarded = request.headers.get("x-forwarded-proto", "")
+    https = request.url.scheme == "https" or forwarded.startswith("https")
+    response.set_cookie(
+        session_auth.COOKIE_NAME,
+        session_auth.issue_token(),
+        max_age=session_auth.SESSION_DAYS * 86400,
+        httponly=True,
+        samesite="lax",
+        secure=https,
+        path="/",
+    )
+    return {"authenticated": True}
+
+
+@router.post("/logout")
+async def logout(response: Response):
+    response.delete_cookie(session_auth.COOKIE_NAME, path="/")
+    return {"authenticated": False}
 
 
 @router.get("/strava")

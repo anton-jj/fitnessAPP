@@ -15,6 +15,11 @@ services:
     image: ghcr.io/${IMAGE_OWNER}-api:${IMAGE_TAG:-latest}
     restart: unless-stopped
     env_file: .env
+    environment:
+      # The daily auto-push is scheduled at 05:00 local. A container defaults to
+      # UTC, which would fire it at 07:00 in central Europe and pick the wrong
+      # calendar day further east.
+      TZ: ${TZ:-UTC}
     volumes:
       - pulse-data:/app/data
     expose:

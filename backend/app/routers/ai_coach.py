@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -15,6 +15,7 @@ from ..config import settings
 from ..services.fit_workout import generate_workout_fit, workout_filename
 from ..services.ics_feed import plan_to_ics
 from ..services.compliance import plan_compliance, adapt_remaining_weeks
+from ..services import session_auth
 import io
 from datetime import datetime, timedelta
 from pydantic import BaseModel
@@ -460,14 +461,32 @@ async def adapt_plan_to_compliance(plan_id: int, db: AsyncSession = Depends(get_
     return {"adapted": True, **adaptation}
 
 
+@router.get("/plan/{plan_id}/calendar-url")
+async def plan_calendar_url(plan_id: int, request: Request):
+    """The subscribable feed URL, key included.
+
+    Behind the session check, so the key only ever reaches someone already
+    signed in — the frontend cannot derive it on its own.
+    """
+    base = str(request.base_url).rstrip("/")
+    url = f"{base}/api/ai/plan/{plan_id}/calendar.ics"
+    if session_auth.is_enabled():
+        url += f"?key={session_auth.feed_key(plan_id)}"
+    return {"url": url}
+
+
 @router.get("/plan/{plan_id}/calendar.ics")
-async def plan_calendar_feed(plan_id: int, db: AsyncSession = Depends(get_db)):
+async def plan_calendar_feed(plan_id: int, key: str | None = None,
+                             db: AsyncSession = Depends(get_db)):
     """Subscribe to the plan from any calendar app.
 
-    Served without auth on purpose — calendar clients cannot log in, and the
-    id is the only thing standing between a URL and the feed. Do not share it
-    more widely than you would share the plan itself.
+    Outside the session check on purpose — calendar clients cannot log in. Once
+    a PIN is set the URL carries a key instead, so the feed cannot be reached by
+    counting plan ids upward. Treat the URL as the secret it is.
     """
+    if not session_auth.verify_feed_key(plan_id, key):
+        raise HTTPException(404, "Plan not found")
+
     result = await db.execute(select(TrainingPlan).where(TrainingPlan.id == plan_id))
     plan = result.scalar_one_or_none()
     if not plan or not plan.plan_data:

@@ -648,3 +648,144 @@ def test_no_limits_behaves_as_before():
                        ftp=250, start_date="2026-08-10")
     assert [w["target_hours"] for w in without["weeks"]] == \
            [w["target_hours"] for w in empty["weeks"]]
+
+
+# --- Stated sessions per sport ---
+
+def peak_sessions(plan: dict, sport: str) -> int:
+    """Sessions in the fullest build week — the one a stated count describes."""
+    return max(
+        (len(sessions_by_day(w, sport)) for w in plan["weeks"]
+         if w["week_type"] == "build"),
+        default=0,
+    )
+
+
+def test_a_stated_session_count_is_delivered():
+    """The athlete's own numbers beat the volume-derived frequency model."""
+    profile = make_profile(weekly_hours=14, max_sessions_per_day=3,
+                           sport_limits={"running": {"sessions": 3},
+                                         "cycling": {"sessions": 6},
+                                         "swimming": {"sessions": 6}})
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    assert peak_sessions(plan, "running") == 3
+    assert peak_sessions(plan, "cycling") == 6
+    assert peak_sessions(plan, "swimming") == 6
+    assert "unmet" not in plan["session_targets"]
+
+
+def test_a_stated_count_raises_frequency_above_the_default():
+    """Six swims is more than the volume model would ever choose on its own."""
+    default = build_plan(make_profile(weekly_hours=14, max_sessions_per_day=3),
+                         ftp=250, start_date="2026-08-10")
+    asked = build_plan(
+        make_profile(weekly_hours=14, max_sessions_per_day=3,
+                     sport_limits={"swimming": {"sessions": 6}}),
+        ftp=250, start_date="2026-08-10")
+    assert peak_sessions(asked, "swimming") > peak_sessions(default, "swimming")
+
+
+def test_a_stated_count_also_holds_frequency_down():
+    """Someone who wants only three runs does not get five because hours rose."""
+    profile = make_profile(weekly_hours=18, max_sessions_per_day=2,
+                           sport_limits={"running": {"sessions": 3}})
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    for week in plan["weeks"]:
+        assert len(sessions_by_day(week, "running")) <= 3, week["week_number"]
+
+
+def test_extra_hours_lengthen_sessions_rather_than_adding_them():
+    pinned = {"running": {"sessions": 3}, "cycling": {"sessions": 5},
+              "swimming": {"sessions": 4}}
+    lean = build_plan(make_profile(weekly_hours=14, max_sessions_per_day=3,
+                                   sport_limits=pinned),
+                      ftp=250, start_date="2026-08-10")
+    rich = build_plan(make_profile(weekly_hours=20, max_sessions_per_day=3,
+                                   sport_limits=pinned),
+                      ftp=250, start_date="2026-08-10")
+    for sport in ("running", "cycling", "swimming"):
+        assert peak_sessions(lean, sport) == peak_sessions(rich, sport)
+    assert max(w["target_hours"] for w in rich["weeks"]) > \
+           max(w["target_hours"] for w in lean["weeks"])
+
+
+def test_an_impossible_request_is_reported_not_silently_dropped():
+    """Fifteen sessions do not fit in six hours. Say so."""
+    profile = make_profile(weekly_hours=6, max_sessions_per_day=3,
+                           sport_limits={"running": {"sessions": 3},
+                                         "cycling": {"sessions": 6},
+                                         "swimming": {"sessions": 6}})
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    unmet = plan["session_targets"]["unmet"]
+    assert set(unmet) == {"running", "cycling", "swimming"}
+    assert "asked for 6/wk" in plan["session_targets"]["note"]
+
+
+def test_a_thin_week_trims_every_discipline_rather_than_erasing_one():
+    profile = make_profile(weekly_hours=7, max_sessions_per_day=3,
+                           sport_limits={"running": {"sessions": 3},
+                                         "cycling": {"sessions": 6},
+                                         "swimming": {"sessions": 6}})
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    for sport in ("running", "cycling", "swimming"):
+        assert peak_sessions(plan, sport) >= 1, sport
+
+
+def test_a_day_restriction_still_outranks_a_stated_count():
+    """Six swims requested, but the pool is open twice a week."""
+    profile = make_profile(weekly_hours=14, max_sessions_per_day=3,
+                           sport_limits={"swimming": {"sessions": 6,
+                                                      "days": ["tuesday", "thursday"]}})
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    for week in plan["weeks"]:
+        for day in sessions_by_day(week, "swimming"):
+            assert day in ("tuesday", "thursday"), day
+    assert plan["session_targets"]["unmet"]["swimming"]["scheduled"] < 6
+
+
+def test_an_explicit_cap_outranks_a_stated_count():
+    profile = make_profile(weekly_hours=14, max_sessions_per_day=3,
+                           sport_limits={"running": {"sessions": 5,
+                                                     "max_sessions": 2}})
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    for week in plan["weeks"]:
+        assert len(sessions_by_day(week, "running")) <= 2
+
+
+def test_lighter_weeks_carry_fewer_of_the_stated_sessions():
+    profile = make_profile(weekly_hours=14, max_sessions_per_day=3,
+                           plan_duration_weeks=12, goal_date="2026-11-01",
+                           sport_limits={"cycling": {"sessions": 6}})
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    taper = [w for w in plan["weeks"] if w["week_type"] == "taper"]
+    build = [w for w in plan["weeks"] if w["week_type"] == "build"]
+    assert taper, "expected a taper week"
+    assert max(len(sessions_by_day(w, "cycling")) for w in taper) < \
+           max(len(sessions_by_day(w, "cycling")) for w in build)
+
+
+def test_stated_counts_still_produce_a_safe_plan():
+    combos = [
+        {"swimming": {"sessions": 6}},
+        {"running": {"sessions": 2}, "cycling": {"sessions": 7}},
+        {"running": {"sessions": 4}, "swimming": {"sessions": 5},
+         "cycling": {"sessions": 5}},
+        {"cycling": {"sessions": 4, "days": ["saturday", "sunday", "wednesday"]}},
+    ]
+    for limits in combos:
+        plan = build_plan(
+            make_profile(weekly_hours=15, max_sessions_per_day=3,
+                         sport_limits=limits),
+            ftp=250, start_date="2026-08-10")
+        assert not plan.get("safety_warnings"), (limits, plan["safety_warnings"])
+
+
+def test_no_stated_counts_leaves_the_plan_unchanged():
+    without = build_plan(make_profile(weekly_hours=13, max_sessions_per_day=2),
+                         ftp=250, start_date="2026-08-10")
+    caps_only = build_plan(
+        make_profile(weekly_hours=13, max_sessions_per_day=2,
+                     sport_limits={"running": {"max_sessions": 4}}),
+        ftp=250, start_date="2026-08-10")
+    assert "session_targets" not in without
+    assert "session_targets" not in caps_only

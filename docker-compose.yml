@@ -3,6 +3,9 @@ services:
     build: ./backend
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Keeps the 05:00 auto-push on local time rather than the container's UTC.
+      TZ: ${TZ:-UTC}
     volumes:
       - pulse-data:/app/data
     ports:

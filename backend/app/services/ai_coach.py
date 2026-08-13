@@ -586,6 +586,21 @@ def _build_strategy_summary(plan: dict, profile: dict, ftp: int,
         if prog.get("note"):
             lines.append(f"Shortfall: {prog['note']}")
 
+    targets = plan.get("session_targets", {})
+    if targets.get("requested"):
+        lines.append("\n--- STATED WEEKLY FREQUENCY ---")
+        lines.append(
+            "The athlete asked for these session counts per week: "
+            + ", ".join(f"{sport} {n}x" for sport, n in sorted(targets["requested"].items()))
+            + ". These are their own decision, already built into the schedule. Do "
+            "not argue with them or suggest different frequencies."
+        )
+        if targets.get("note"):
+            lines.append(
+                f"Not all of it fit ({targets['note']}) — the schedule below is what "
+                "was actually possible. You may mention this once in capacity_feedback."
+            )
+
     lines.append("\n--- WEEK SHAPES ---")
     lines.append(
         "Weekly volume is already fixed and cannot be changed — it ramps to the "

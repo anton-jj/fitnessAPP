@@ -1,11 +1,20 @@
 const BASE = '/api'
 
+/** Fired when the API rejects us — the session expired, or the app restarted
+ *  with an ephemeral signing key. AuthGate listens and shows the PIN screen. */
+export const UNAUTHORIZED_EVENT = 'pulse:unauthorized'
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     ...options,
   })
   if (!res.ok) {
+    // The login call reports its own failures; anything else getting a 401
+    // means the session went away underneath us.
+    if (res.status === 401 && !path.startsWith('/auth/login')) {
+      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+    }
     const text = await res.text()
     let detail = text
     try {
@@ -123,8 +132,15 @@ export const api = {
   planCompliance: (planId: number) => request<any>(`/ai/plan/${planId}/compliance`),
   adaptPlan: (planId: number) =>
     request<any>(`/ai/plan/${planId}/adapt`, { method: 'POST' }),
+  // The feed URL carries a key once a PIN is set, and only the server can
+  // derive it — so this is fetched rather than built here.
   planCalendarUrl: (planId: number) =>
-    `${window.location.origin}${BASE}/ai/plan/${planId}/calendar.ics`,
+    request<{ url: string }>(`/ai/plan/${planId}/calendar-url`).then((r) => r.url),
+
+  session: () => request<{ required: boolean; authenticated: boolean }>('/auth/session'),
+  login: (pin: string) =>
+    request<any>('/auth/login', { method: 'POST', body: JSON.stringify({ pin }) }),
+  logout: () => request<any>('/auth/logout', { method: 'POST' }),
 
   // .fit workout file for direct import into Garmin Connect or the COROS app
   downloadWorkoutFile: async (workout: any, date: string) => {

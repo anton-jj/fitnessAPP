@@ -146,7 +146,18 @@ export default function Plan() {
           <CalendarDays className="w-5 h-5 text-accent" /> Training Plan
         </h1>
         {hasPlan && (
-          <span className="text-xs text-slate-500">{plan.name}</span>
+          <div className="flex items-center gap-3 min-w-0">
+            <span className="text-xs text-slate-500 truncate">{plan.name}</span>
+            {/* Without this the profile is unreachable once a plan exists — the
+                onboarding entry point below only renders when there is none. */}
+            <button
+              onClick={() => navigate('/onboarding')}
+              className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-slate-200 border border-white/10 hover:border-white/20 rounded-lg px-2.5 py-1.5 transition-colors shrink-0"
+            >
+              <UserCog className="w-3.5 h-3.5" />
+              Edit setup
+            </button>
+          </div>
         )}
       </div>
 
@@ -294,6 +305,19 @@ export default function Plan() {
               <div className="flex items-start gap-2 bg-warning/10 border border-warning/20 rounded-xl p-3 text-sm text-warning">
                 <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
                 <span>{plan.plan.capacity_feedback}</span>
+              </div>
+            )}
+            {plan.plan.session_targets?.note && (
+              <div className="flex items-start gap-2 bg-warning/10 border border-warning/20 rounded-xl p-3 text-sm text-warning">
+                <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                <div>
+                  <span className="block">
+                    Could not fit every session you asked for — {plan.plan.session_targets.note}.
+                  </span>
+                  <span className="block text-warning/70 text-xs mt-1">
+                    Add hours, allow more sessions per day, or free up a rest day.
+                  </span>
+                </div>
               </div>
             )}
           </div>
@@ -446,9 +470,18 @@ export default function Plan() {
               </button>
               <button
                 onClick={() => {
-                  navigator.clipboard.writeText(api.planCalendarUrl(plan.id))
-                  setCopiedFeed(true)
-                  setTimeout(() => setCopiedFeed(false), 3000)
+                  // The URL now comes from the server, so it is not known at
+                  // click time. Hand the promise to the clipboard rather than
+                  // awaiting first — Safari rejects a write that resumes after
+                  // an await, and Chrome accepts either form.
+                  const url = api.planCalendarUrl(plan.id)
+                  navigator.clipboard
+                    .write([new ClipboardItem({ 'text/plain': url.then((u) => new Blob([u], { type: 'text/plain' })) })])
+                    .catch(async () => navigator.clipboard.writeText(await url))
+                    .then(() => {
+                      setCopiedFeed(true)
+                      setTimeout(() => setCopiedFeed(false), 3000)
+                    })
                 }}
                 className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-bg-secondary border border-white/5 hover:bg-bg-hover transition-colors"
                 title="Subscribe to this plan from any calendar app"

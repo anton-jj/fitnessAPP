@@ -272,7 +272,8 @@ def _average_session_hours(weekly_hours: float) -> float:
 
 
 def compute_session_target(weekly_hours: float, n_sports: int, n_days: int,
-                           max_sessions_per_day: int = 1) -> int:
+                           max_sessions_per_day: int = 1,
+                           requested: dict[str, int] | None = None) -> int:
     """How many endurance sessions the week should contain.
 
     Frequency has to follow volume, not the calendar. Spreading 12 hours over
@@ -281,9 +282,21 @@ def compute_session_target(weekly_hours: float, n_sports: int, n_days: int,
 
     Roughly:  <5h -> 1 per sport,  5-9h -> 2 per sport,
               9-14h -> 3 per sport,  14h+ -> 4+ per sport
+
+    An athlete who has stated a weekly frequency per discipline overrides the
+    model: the week has to be big enough to hold what they asked for. The day
+    capacity still bounds it — nobody gets more sessions than they have slots.
     """
     target = round(weekly_hours / _average_session_hours(weekly_hours))
     target = max(target, n_sports)
+    if requested:
+        # Cap the ask at what the hours can actually hold. Without this the week
+        # is built with more sessions than it can feed and the duration pass
+        # drops them by day order, which trims one discipline far below its
+        # request while another keeps everything. Trimming the counts up front
+        # lets the allocator shed sessions from the largest asks instead.
+        affordable = int(weekly_hours * 60 // MIN_SESSION_DURATION)
+        target = max(target, min(sum(requested.values()), max(affordable, n_sports)))
     return min(target, n_days * max(1, max_sessions_per_day))
 
 
@@ -293,16 +306,47 @@ def compute_session_target(weekly_hours: float, n_sports: int, n_days: int,
 PRIMARY_SESSION_BONUS = 1.40
 
 
+def requested_sessions(sport: str, limits: dict | None = None) -> int | None:
+    """The weekly session count the athlete asked for, if they named one.
+
+    Distinct from `max_sessions`, which only caps. Someone who knows they want
+    six swims needs a number the planner builds toward, not a ceiling that a
+    volume-driven allocation may never reach.
+    """
+    entry = (limits or {}).get(sport) or {}
+    try:
+        wanted = int(entry.get("sessions"))
+    except (TypeError, ValueError):
+        return None
+    return wanted if wanted > 0 else None
+
+
+def _scale_requested(requested: dict[str, int], scale: float) -> dict[str, int]:
+    """Shrink stated weekly counts for a lighter week, never below one."""
+    if not requested or scale >= 0.95:
+        return dict(requested)
+    return {sport: max(1, round(n * scale)) for sport, n in requested.items()}
+
+
 def _sport_ceiling(sport: str, limits: dict | None = None) -> int:
     """Weekly session ceiling for a discipline, athlete's limit taking priority."""
     default = SPORT_PROPERTIES.get(sport, {}).get("max_weekly_sessions", 7)
-    stated = (limits or {}).get(sport, {}).get("max_sessions")
-    return min(default, stated) if stated else default
+    entry = (limits or {}).get(sport) or {}
+    stated = entry.get("max_sessions")
+    ceiling = min(default, stated) if stated else default
+    # Asking for six swims raises the swim ceiling — the sport default exists to
+    # stop the allocator over-filling a discipline, not to overrule the athlete.
+    # An explicit max_sessions is a real limit, so it still wins.
+    wanted = requested_sessions(sport, limits)
+    if wanted:
+        ceiling = min(stated, wanted) if stated else max(ceiling, wanted)
+    return ceiling
 
 
 def _allocate_sport_sessions(real_sports: list[str], total_sessions: int,
                              primary_sport: str | None,
-                             limits: dict | None = None) -> dict[str, int]:
+                             limits: dict | None = None,
+                             requested: dict[str, int] | None = None) -> dict[str, int]:
     """Split the week's sessions across disciplines.
 
     Everyone gets one, then the rest are dealt round-robin starting with the
@@ -310,10 +354,34 @@ def _allocate_sport_sessions(real_sports: list[str], total_sessions: int,
     common case even (3-3-3 for a triathlete) while sending any odd session to
     swimming and cycling — the disciplines that can absorb extra frequency
     without extra injury risk.
+
+    Disciplines the athlete gave an explicit weekly count are pinned to it and
+    sit out the share-out; only the rest compete for what is left. If the week
+    cannot hold every pinned count, the largest requests give up a session each
+    in turn rather than one discipline being starved to protect the others.
     """
-    counts = {s: 1 for s in real_sports}
-    remaining = total_sessions - len(real_sports)
-    if remaining <= 0:
+    pinned = {
+        sport: min(n, _sport_ceiling(sport, limits))
+        for sport, n in (requested or {}).items()
+        if sport in real_sports and n
+    }
+    free = [s for s in real_sports if s not in pinned]
+
+    # Every free discipline still needs its one session, so that is what the
+    # pinned counts have to fit alongside.
+    budget = max(total_sessions - len(free), len(pinned))
+    while pinned and sum(pinned.values()) > budget:
+        biggest = max(pinned, key=lambda s: (pinned[s], s))
+        if pinned[biggest] <= 1:
+            break
+        pinned[biggest] -= 1
+
+    counts = dict(pinned)
+    for sport in free:
+        counts[sport] = 1
+
+    remaining = total_sessions - sum(counts.values())
+    if remaining <= 0 or not free:
         return counts
 
     # Extras are shared by session weight, not evenly: the bike absorbs the
@@ -327,7 +395,7 @@ def _allocate_sport_sessions(real_sports: list[str], total_sessions: int,
             SPORT_PROPERTIES.get(sport, {}).get("session_weight", 1.0),
             PRIMARY_SESSION_BONUS if sport == primary_sport else 0.0,
         )
-        for sport in real_sports
+        for sport in free
     }
     total_weight = sum(weights.values()) or 1.0
 
@@ -344,16 +412,18 @@ def _allocate_sport_sessions(real_sports: list[str], total_sessions: int,
         counts[sport] += n
 
     # Respect per-sport ceilings, pushing any overflow to whoever has room.
+    # Pinned disciplines are already at the count the athlete asked for, so
+    # overflow never lands on them.
     def ceiling(sport: str) -> int:
         return _sport_ceiling(sport, limits)
 
     overflow = 0
-    for sport in real_sports:
+    for sport in free:
         if counts[sport] > ceiling(sport):
             overflow += counts[sport] - ceiling(sport)
             counts[sport] = ceiling(sport)
 
-    order = sorted(real_sports, key=lambda s: -weights[s])
+    order = sorted(free, key=lambda s: -weights[s])
     while overflow > 0:
         placed = False
         for sport in order:
@@ -678,7 +748,8 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
                           easy_days: list[str], primary_sport: str | None,
                           total_sessions: int,
                           max_sessions_per_day: int = 1,
-                          limits: dict | None = None) -> list[dict]:
+                          limits: dict | None = None,
+                          requested: dict[str, int] | None = None) -> list[dict]:
     """Place every session of the week on a day.
 
     Returns a flat list of {day, sport} slots — more than one per day once the
@@ -696,7 +767,7 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
         return []
 
     remaining = _allocate_sport_sessions(real_sports, total_sessions,
-                                         primary_sport, limits)
+                                         primary_sport, limits, requested)
     slots: list[dict] = []
     day_sports: dict[str, set[str]] = {}
 
@@ -1656,6 +1727,12 @@ def build_plan(profile: dict, ftp: int,
     # Hard constraints the athlete gave us: pool days, an injured knee capping
     # run frequency. These bound the planner rather than nudging it.
     sport_limits = profile.get("sport_limits") or {}
+    # Disciplines they gave an explicit weekly frequency for. The planner builds
+    # toward these instead of deriving frequency from volume alone.
+    requested_per_sport = {
+        sport: n for sport in real_sports
+        if (n := requested_sessions(sport, sport_limits))
+    }
 
     # Where the ramp starts. Synced history beats the onboarding slider, and an
     # explicit answer from the athlete beats both.
@@ -1738,13 +1815,20 @@ def build_plan(profile: dict, ftp: int,
             })
             continue
 
+        # A stated frequency describes a normal week. Lighter weeks carry
+        # proportionally fewer sessions rather than the same number squeezed
+        # under their useful minimum — the same rule the volume model uses.
+        week_requested = _scale_requested(
+            requested_per_sport, week_multipliers[week_idx] * partial_factor,
+        )
+
         session_target = compute_session_target(
             week_minutes / 60, len(real_sports), len(week_training_days),
-            max_sessions_per_day,
+            max_sessions_per_day, week_requested,
         )
         sport_schedule = _build_sport_schedule(
             sports, week_quality_days, week_easy_days, primary_sport,
-            session_target, max_sessions_per_day, sport_limits,
+            session_target, max_sessions_per_day, sport_limits, week_requested,
         )
         base_slots = _assign_archetypes(
             sport_schedule, week_quality_days, capacity["long_session_essential"],
@@ -1843,11 +1927,53 @@ def build_plan(profile: dict, ftp: int,
         "progression_notes": "",
     }
 
+    if requested_per_sport:
+        plan["session_targets"] = _session_frequency_report(weeks, requested_per_sport)
+
     safety_warnings = validate_plan(plan, profile)
     if safety_warnings:
         plan["safety_warnings"] = safety_warnings
 
     return plan
+
+
+def _session_frequency_report(weeks: list[dict],
+                              requested: dict[str, int]) -> dict:
+    """Compare the frequency the athlete asked for against what got scheduled.
+
+    A request can go unmet for honest reasons — not enough days, not enough
+    hours to give every session a useful length, a per-sport day restriction.
+    Say so rather than quietly handing back a different plan from the one they
+    asked for.
+    """
+    scheduled: dict[str, int] = {}
+    for week in weeks:
+        if week.get("week_type") not in ("build", None):
+            continue
+        counts: dict[str, int] = {}
+        for day in week.get("days", []):
+            for workout in day.get("workouts", []):
+                sport = workout.get("sport")
+                if sport in requested:
+                    counts[sport] = counts.get(sport, 0) + 1
+        # The fullest build week is the one the request describes; earlier ramp
+        # weeks are deliberately smaller.
+        for sport, n in counts.items():
+            scheduled[sport] = max(scheduled.get(sport, 0), n)
+
+    shortfalls = {
+        sport: {"requested": n, "scheduled": scheduled.get(sport, 0)}
+        for sport, n in requested.items()
+        if scheduled.get(sport, 0) < n
+    }
+    report = {"requested": dict(requested), "scheduled": scheduled}
+    if shortfalls:
+        report["unmet"] = shortfalls
+        report["note"] = "; ".join(
+            f"{sport}: asked for {v['requested']}/wk, scheduled {v['scheduled']}"
+            for sport, v in sorted(shortfalls.items())
+        )
+    return report
 
 
 def _rest_day(day_name: str, day_date: datetime) -> dict:

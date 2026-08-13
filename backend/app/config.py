@@ -3,8 +3,15 @@ from pathlib import Path
 
 
 class Settings(BaseSettings):
-    app_secret_key: str = "change-me"
+    # Set APP_PIN to require a PIN before anything is reachable. Unset means no
+    # authentication at all — only safe on a trusted network.
     app_pin: str = ""
+    # Signs session cookies. Unset gets a random per-process key, so sessions
+    # end at restart; set it to keep people logged in across deploys.
+    app_secret_key: str = "change-me"
+    # Comma-separated origins allowed to call the API cross-origin. Empty means
+    # same-origin only, which is what a self-hosted instance needs.
+    cors_origins: str = ""
 
     strava_client_id: str = ""
     strava_client_secret: str = ""
