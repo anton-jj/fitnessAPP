@@ -219,14 +219,87 @@ When multiple designs satisfy the required weekly volume, prefer the one that:
 - Never overemphasize one discipline without event-specific justification"""
 
 
-STRATEGY_PROMPT = """You are an expert endurance sports coach setting the direction for a training block.
+# Used only when the athlete has explicitly opted into training_style ==
+# "norwegian" — plan_builder has already applied the hard guards (minimum
+# weekly hours, no cutback weeks, no stacking on an active ramp) and
+# restructured up to two quality days into AM sub-threshold / PM shakeout
+# pairs, tagging the AM session's workout_type "sub_threshold". Unlike
+# TRAINING_PHILOSOPHY above, this block names the method explicitly — the
+# athlete chose it and wants it coached as such, not described generically.
+NORWEGIAN_TRAINING_PHILOSOPHY = """## TRAINING PHILOSOPHY: NORWEGIAN DOUBLE-THRESHOLD METHOD
+
+This athlete has opted into Norwegian-style double-threshold training. Unlike the
+generic methodology-agnostic approach, name the method explicitly and coach to it —
+the athlete chose this style and expects it, not a euphemism for it.
+
+### The Method
+- Up to two days a week carry a double session: a controlled AM sub-threshold
+  session (~90-95% FTP / threshold pace, RPE 5-6) followed by an easy PM shakeout
+  in a lower-stress discipline (never a second run the same day).
+- Sub-threshold work is intentionally SHORT rest between reps (about a minute) so
+  the athlete stays just under threshold rather than recovering enough to push
+  over it — the point is high-quality time near threshold with low accumulated
+  fatigue, not maximal single efforts.
+- The AM session's `workout_type` is already "sub_threshold" in the envelope —
+  write intervals that hold that effort steady and controlled, not building to a
+  crescendo like a normal threshold set.
+- The PM shakeout is genuinely easy (recovery pace/power) — its only job is
+  circulation and technique, never intensity. Keep it short and low-key.
+- The other quality/easy/long sessions in the week follow the same volume,
+  frequency and sport-cost principles below — double-threshold days replace some
+  of the week's quality slots, they do not add new methodology on top of them.
+
+### Volume vs Intensity
+- Volume is still the preferred adaptation driver — double-threshold days control
+  how much QUALITY time near threshold the athlete can absorb without excess
+  fatigue, they do not replace easy volume elsewhere in the week.
+- Higher-volume athletes mainly gain additional easy training, not more doubles.
+
+### Sport-Specific Cost
+- Running: highest orthopedic stress. Increase cautiously. Protect key run sessions.
+- Cycling: lowest orthopedic stress. THE volume engine — for a multi-sport athlete
+  the bike should carry the largest share of weekly hours (roughly 45-60%).
+- Swimming: technique-limited. Frequency > long sessions.
+- Strength: adds fatigue. Heavy lower-body should not interfere with key run workouts.
+
+### Event Specificity
+As race distance increases, required durability and volume increase and the
+ability to substitute volume with intensity decreases — double-threshold days
+sharpen threshold-adjacent fitness, they do not substitute for race-specific
+long-session volume.
+
+### Session Archetypes
+Every session in the envelope is tagged with its archetype (quality/easy/long).
+Respect those tags, including the AM/PM pairing on double-threshold days.
+
+### Progression Rules
+- Only increase one major variable at a time (volume, frequency, intensity, duration)
+- Include recovery weeks every 3-5 weeks (20-40% volume reduction) — double-threshold
+  days are never scheduled in a recovery or taper week
+- Never increase multiple variables simultaneously
+
+### Safety Constraints (MUST follow)
+- Never turn the PM shakeout into a second hard session
+- Never schedule double-threshold days back to back or adjacent to the long session
+- Never increase running load too rapidly
+- Never omit recovery weeks
+- Never overemphasize one discipline without event-specific justification"""
+
+
+def _philosophy_block(training_style: str) -> str:
+    return NORWEGIAN_TRAINING_PHILOSOPHY if training_style == "norwegian" else TRAINING_PHILOSOPHY
+
+
+STRATEGY_PROMPT_HEAD = """You are an expert endurance sports coach setting the direction for a training block.
 
 The plan builder has already computed the TRAINING ENVELOPE — weekly hours, session
 durations, quality/easy slots, sport distribution and recovery weeks. You are NOT
 writing individual workouts here. You are deciding the BLOCK STRATEGY that a second
 pass will use to write each week.
 
-""" + TRAINING_PHILOSOPHY + """
+"""
+
+STRATEGY_PROMPT_TAIL = """
 
 ## WHAT TO RETURN
 
@@ -251,12 +324,23 @@ quality session that week. Vary the workout types across weeks so each energy sy
 is developed, and progress them deliberately rather than at random. Return ONLY JSON."""
 
 
-WEEK_PROMPT = """You are an expert endurance sports coach writing one week of a training plan.
+def _strategy_prompt(training_style: str = "standard") -> str:
+    return STRATEGY_PROMPT_HEAD + _philosophy_block(training_style) + STRATEGY_PROMPT_TAIL
+
+
+# Kept as a module-level constant too — some tests/tools may still import it
+# directly, and the standard style is the default.
+STRATEGY_PROMPT = _strategy_prompt("standard")
+
+
+WEEK_PROMPT_HEAD = """You are an expert endurance sports coach writing one week of a training plan.
 
 You are given the block strategy and the ENVELOPE for a single week: every session's
 day, sport, archetype and duration. Write the actual workouts for that week only.
 
-""" + TRAINING_PHILOSOPHY + """
+"""
+
+WEEK_PROMPT_TAIL = """
 
 ## HOW TO WRITE STEPS PER SPORT
 
@@ -299,6 +383,14 @@ Return a JSON object and nothing else:
 }
 
 Do not include rest days. Return ONLY JSON."""
+
+
+def _week_prompt(training_style: str = "standard") -> str:
+    return WEEK_PROMPT_HEAD + _philosophy_block(training_style) + WEEK_PROMPT_TAIL
+
+
+# Kept as a module-level constant too, for the same reason as STRATEGY_PROMPT.
+WEEK_PROMPT = _week_prompt("standard")
 
 
 def _build_user_prompt(sport: str, session_type: str, duration_minutes: int,
@@ -344,8 +436,14 @@ async def generate_structured_plan(profile: dict, ftp: int,
                       css_pace=settings.swim_css_pace,
                       first_week_from=first_week_from)
 
+    # Norwegian style is named and coached explicitly rather than through the
+    # methodology-agnostic philosophy — see NORWEGIAN_TRAINING_PHILOSOPHY.
+    training_style = profile.get("training_style", "standard")
+    strategy_prompt = _strategy_prompt(training_style)
+    week_prompt = _week_prompt(training_style)
+
     strategy = await _generate(
-        STRATEGY_PROMPT,
+        strategy_prompt,
         _build_strategy_summary(plan, profile, ftp, fitness_context),
         tier="heavy",
     )
@@ -373,7 +471,7 @@ async def generate_structured_plan(profile: dict, ftp: int,
                 week, week_strategies.get(week["week_number"]), plan, profile, ftp,
                 fitness_context,
             )
-            return week, await _generate(WEEK_PROMPT, summary, tier="heavy")
+            return week, await _generate(week_prompt, summary, tier="heavy")
 
     results = await asyncio.gather(
         *(write_week(w) for w in plan["weeks"]), return_exceptions=True,

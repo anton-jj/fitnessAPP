@@ -34,6 +34,10 @@ async def _migrate(conn):
         ("athlete_profile", "max_sessions_per_day", "INTEGER DEFAULT 1"),
         ("athlete_profile", "current_weekly_hours", "FLOAT"),
         ("athlete_profile", "sport_limits", "JSON"),
+        ("athlete_profile", "recovery_mode", "TEXT DEFAULT 'auto'"),
+        ("athlete_profile", "recovery_cycle_weeks", "INTEGER"),
+        ("athlete_profile", "volume_progression_mode", "TEXT DEFAULT 'ramp'"),
+        ("athlete_profile", "training_style", "TEXT DEFAULT 'standard'"),
     ]
     for table, column, col_type in column_migrations:
         try:

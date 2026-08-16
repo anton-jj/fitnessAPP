@@ -21,6 +21,13 @@ from app.services.plan_builder import (
     compute_volume_progression,
     format_pace,
     run_pace_seconds,
+    MAX_CONSECUTIVE_BUILD_WEEKS,
+    MAX_RECOVERY_CYCLE_EXTENSION_WEEKS,
+    STEADY_MODE_MAX_JUMP_FROM_HISTORY,
+    norwegian_method_eligible,
+    NORWEGIAN_DOUBLE_THRESHOLD_DAYS_PER_WEEK,
+    MIN_DAYS_BETWEEN_DOUBLE_THRESHOLD,
+    _session_frequency_report,
 )
 
 EVENTS = ["5k", "10k", "marathon", "olympic_triathlon", "ironman_70.3",
@@ -225,6 +232,44 @@ def test_recovery_cadence_by_experience(experience, build_run):
     assert week_types[build_run] == "recovery"
 
 
+def test_extended_recovery_mode_uses_the_stated_cycle_length():
+    week_types = compute_recovery_schedule(20, "intermediate", "extended",
+                                           recovery_cycle_weeks=6)
+    assert week_types[:6] == ["build"] * 6
+    assert week_types[6] == "recovery"
+
+
+def test_extended_recovery_cycle_is_clamped():
+    """A cycle longer than MAX_RECOVERY_CYCLE_EXTENSION_WEEKS is capped, not honored."""
+    week_types = compute_recovery_schedule(30, "advanced", "extended",
+                                           recovery_cycle_weeks=20)
+    assert week_types[:MAX_RECOVERY_CYCLE_EXTENSION_WEEKS] == \
+        ["build"] * MAX_RECOVERY_CYCLE_EXTENSION_WEEKS
+    assert week_types[MAX_RECOVERY_CYCLE_EXTENSION_WEEKS] == "recovery"
+
+
+@pytest.mark.parametrize("experience", ["beginner", "intermediate", "advanced"])
+def test_recovery_off_still_forces_a_week_at_the_consecutive_build_ceiling(experience):
+    ceiling = MAX_CONSECUTIVE_BUILD_WEEKS[experience]
+    week_types = compute_recovery_schedule(ceiling + 5, experience, "off")
+    assert week_types[:ceiling] == ["build"] * ceiling
+    assert week_types[ceiling] == "recovery", (
+        "off cannot be combined with a long block to dodge recovery altogether"
+    )
+
+
+def test_recovery_off_has_no_recovery_week_under_the_ceiling():
+    week_types = compute_recovery_schedule(5, "intermediate", "off")
+    assert week_types == ["build"] * 5
+
+
+def test_a_buried_athlete_opens_the_block_in_recovery_regardless_of_mode():
+    profile = make_profile(recovery_mode="off")
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10",
+                      fitness_context={"tsb": -30, "ctl": 70})
+    assert plan["weeks"][0]["week_type"] == "recovery"
+
+
 def test_each_discipline_gets_at_most_one_long_session_per_week():
     plan = build_plan(make_profile(weekly_hours=12), ftp=250, start_date="2026-08-10")
     for week in plan["weeks"]:
@@ -307,6 +352,56 @@ def test_weekly_increase_never_exceeds_the_safe_step():
         build = [m for m, t in zip(multipliers, week_types) if t == "build"]
         for previous, current in zip(build, build[1:]):
             assert current / previous <= 1 + limit + 1e-6
+
+
+# --- Steady volume mode ---
+
+def test_steady_mode_ramps_in_then_holds_flat_at_the_history_cap():
+    week_types = compute_recovery_schedule(12, "intermediate")
+    multipliers = compute_volume_progression(week_types, "intermediate", 0.5, mode="steady")
+    build = [m for m, t in zip(multipliers, week_types) if t == "build"]
+    ceiling = 0.5 * STEADY_MODE_MAX_JUMP_FROM_HISTORY
+    assert max(build) == pytest.approx(ceiling, abs=0.01)
+    assert build == sorted(build), "steady mode should never reduce volume mid-block"
+    assert build[-1] == pytest.approx(ceiling, abs=0.01), "should hold at the cap, not keep climbing"
+    assert build[0] < build[-1], "should still ramp in rather than opening flat"
+
+
+def test_steady_mode_never_exceeds_the_ramp_ceiling_when_history_is_close_to_target():
+    """Someone already training near their stated hours should barely ramp."""
+    week_types = compute_recovery_schedule(8, "intermediate")
+    multipliers = compute_volume_progression(week_types, "intermediate", 0.95, mode="steady")
+    build = [m for m, t in zip(multipliers, week_types) if t == "build"]
+    assert max(build) <= 1.0
+    assert min(build) >= 0.95 - 1e-6
+
+
+def test_steady_mode_without_history_falls_back_to_ramp():
+    week_types = compute_recovery_schedule(8, "intermediate")
+    steady = compute_volume_progression(week_types, "intermediate", None, mode="steady")
+    ramp = compute_volume_progression(week_types, "intermediate", None, mode="ramp")
+    assert steady == ramp
+
+
+def test_build_plan_steady_mode_holds_flat_near_current_volume():
+    profile = make_profile(weekly_hours=16, current_weekly_hours=8,
+                           volume_progression_mode="steady", plan_duration_weeks=10)
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    build_hours = [w["target_hours"] for w in plan["weeks"] if w["week_type"] == "build"]
+    peak = max(build_hours)
+    assert peak <= 8 * STEADY_MODE_MAX_JUMP_FROM_HISTORY * 1.1, (
+        f"steady mode peaked at {peak}h, expected near the 1.15x history cap"
+    )
+    assert peak < 16 * 0.85, "steady mode should not approach the full stated hours"
+
+
+def test_build_plan_steady_mode_without_history_behaves_like_ramp():
+    steady = build_plan(make_profile(volume_progression_mode="steady"),
+                        ftp=250, start_date="2026-08-10")
+    ramp = build_plan(make_profile(volume_progression_mode="ramp"),
+                      ftp=250, start_date="2026-08-10")
+    assert [w["target_hours"] for w in steady["weeks"]] == \
+           [w["target_hours"] for w in ramp["weeks"]]
 
 
 def test_recovery_weeks_are_lighter_than_the_build_weeks_around_them():
@@ -719,6 +814,91 @@ def test_an_impossible_request_is_reported_not_silently_dropped():
     unmet = plan["session_targets"]["unmet"]
     assert set(unmet) == {"running", "cycling", "swimming"}
     assert "asked for 6/wk" in plan["session_targets"]["note"]
+    # Six hours cannot fit fifteen sessions even at the block's peak volume —
+    # a real capacity mismatch, not expected ramp-week scaling.
+    assert plan["session_targets"]["shortfall_expected"] is False
+
+
+# --- session_targets.shortfall_expected: expected vs real ---
+
+def week_with_counts(week_number: int, week_type: str,
+                     sport_counts: dict[str, int]) -> dict:
+    """A minimal synthetic week for _session_frequency_report unit tests."""
+    workouts = [
+        {"sport": sport} for sport, n in sport_counts.items() for _ in range(n)
+    ]
+    return {
+        "week_number": week_number, "week_type": week_type,
+        "days": [{"date": f"2026-08-{9 + week_number:02d}", "workouts": workouts}],
+    }
+
+
+def test_shortfall_expected_true_when_only_ramp_weeks_fall_short():
+    """A shortfall that only ever shows up before the block reaches peak
+    volume is expected — nothing for the athlete to act on."""
+    weeks = [
+        week_with_counts(1, "build", {"swimming": 2}),
+        week_with_counts(2, "build", {"swimming": 2}),
+    ]
+    report = _session_frequency_report(
+        weeks, {"swimming": 4},
+        week_multipliers=[0.5, 0.6], peak_multiplier=1.0, volume_mode="ramp",
+    )
+    assert report["unmet"]["swimming"]["scheduled"] == 2
+    assert report["shortfall_expected"] is True
+
+
+def test_shortfall_expected_false_when_the_peak_week_falls_short():
+    weeks = [
+        week_with_counts(1, "build", {"swimming": 2}),
+        week_with_counts(2, "build", {"swimming": 2}),
+    ]
+    report = _session_frequency_report(
+        weeks, {"swimming": 4},
+        # Week 2's multiplier equals the block's peak — its shortfall is real.
+        week_multipliers=[0.5, 1.0], peak_multiplier=1.0, volume_mode="ramp",
+    )
+    assert report["unmet"]["swimming"]["scheduled"] == 2
+    assert report["shortfall_expected"] is False
+
+
+def test_shortfall_expected_false_in_steady_mode_even_early_in_the_block():
+    """Steady mode gets no ramp-week leniency — it is not supposed to keep
+    climbing the way ramp mode does."""
+    weeks = [week_with_counts(1, "build", {"swimming": 2})]
+    report = _session_frequency_report(
+        weeks, {"swimming": 4},
+        week_multipliers=[0.5], peak_multiplier=0.6, volume_mode="steady",
+    )
+    assert report["shortfall_expected"] is False
+
+
+def test_recovery_week_shortfalls_are_folded_in_as_expected():
+    weeks = [
+        week_with_counts(1, "build", {"swimming": 2}),
+        week_with_counts(2, "recovery", {"swimming": 1}),
+    ]
+    report = _session_frequency_report(
+        weeks, {"swimming": 4},
+        week_multipliers=[0.5, 0.3], peak_multiplier=1.0, volume_mode="ramp",
+    )
+    assert report["unmet"]["swimming"]["scheduled"] == 2
+    assert report["shortfall_expected"] is True
+
+
+def test_shortfall_expected_defaults_to_real_without_multiplier_context():
+    """Callers that don't supply week_multipliers/peak_multiplier get the
+    conservative answer — a shortfall is treated as real, not suppressed."""
+    weeks = [week_with_counts(1, "build", {"swimming": 2})]
+    report = _session_frequency_report(weeks, {"swimming": 4})
+    assert report["shortfall_expected"] is False
+
+
+def test_no_shortfall_means_no_shortfall_expected_field():
+    weeks = [week_with_counts(1, "build", {"swimming": 4})]
+    report = _session_frequency_report(weeks, {"swimming": 4})
+    assert "unmet" not in report
+    assert "shortfall_expected" not in report
 
 
 def test_a_thin_week_trims_every_discipline_rather_than_erasing_one():
@@ -789,3 +969,172 @@ def test_no_stated_counts_leaves_the_plan_unchanged():
         ftp=250, start_date="2026-08-10")
     assert "session_targets" not in without
     assert "session_targets" not in caps_only
+
+
+# --- Long-session day placement ---
+
+def long_days(week: dict) -> dict[str, str]:
+    """Which day carries each sport's "long" session, if any."""
+    result = {}
+    for day in week["days"]:
+        for w in day["workouts"]:
+            if w.get("archetype") == "long":
+                result[w["sport"]] = day["day"]
+    return result
+
+
+def test_explicit_long_days_are_honored_and_never_collide():
+    profile = make_profile(
+        weekly_hours=14, sports=["cycling", "running"], max_sessions_per_day=1,
+        sport_limits={"running": {"long_day": "sunday"},
+                      "cycling": {"long_day": "saturday"}},
+    )
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    for week in plan["weeks"]:
+        days = long_days(week)
+        if "running" in days:
+            assert days["running"] == "sunday", week["week_number"]
+        if "cycling" in days:
+            assert days["cycling"] == "saturday", week["week_number"]
+        if "running" in days and "cycling" in days:
+            assert days["running"] != days["cycling"]
+
+
+def test_long_sessions_avoid_the_same_day_when_no_day_is_pinned():
+    """The original bug: two disciplines both landing their long session on
+    the same day (e.g. Sunday) with no explicit day set for either."""
+    profile = make_profile(weekly_hours=14, sports=["cycling", "running"],
+                           max_sessions_per_day=1)
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    for week in plan["weeks"]:
+        days = long_days(week)
+        if "running" in days and "cycling" in days:
+            assert days["running"] != days["cycling"], week["week_number"]
+
+
+def test_a_pinned_long_day_still_produces_a_safe_plan():
+    profile = make_profile(
+        weekly_hours=15, sports=["cycling", "running", "swimming"],
+        max_sessions_per_day=2,
+        sport_limits={"running": {"long_day": "sunday"},
+                      "cycling": {"long_day": "sunday"}},  # both pinned to the same day, on purpose
+    )
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    assert not plan.get("safety_warnings"), plan.get("safety_warnings")
+
+
+# --- Locking a sport's session count ---
+
+def test_locked_session_count_holds_flat_across_the_ramp():
+    profile = make_profile(weekly_hours=14, max_sessions_per_day=2,
+                           plan_duration_weeks=8,
+                           sport_limits={"swimming": {"sessions": 6, "lock_sessions": True}})
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    build_weeks = [w for w in plan["weeks"] if w["week_type"] == "build"]
+    counts = [len(sessions_by_day(w, "swimming")) for w in build_weeks]
+    assert all(c == 6 for c in counts), counts
+
+
+def test_lock_sessions_holds_the_count_that_would_otherwise_scale_down():
+    unlocked = build_plan(
+        make_profile(weekly_hours=14, max_sessions_per_day=2,
+                     sport_limits={"swimming": {"sessions": 6}}),
+        ftp=250, start_date="2026-08-10")
+    locked = build_plan(
+        make_profile(weekly_hours=14, max_sessions_per_day=2,
+                     sport_limits={"swimming": {"sessions": 6, "lock_sessions": True}}),
+        ftp=250, start_date="2026-08-10")
+    first_unlocked = len(sessions_by_day(unlocked["weeks"][0], "swimming"))
+    first_locked = len(sessions_by_day(locked["weeks"][0], "swimming"))
+    assert first_locked == 6
+    assert first_unlocked < first_locked
+
+
+def test_a_locked_recovery_week_still_scales_down():
+    """A lock is a frequency preference, not a safety override."""
+    profile = make_profile(weekly_hours=14, max_sessions_per_day=2,
+                           plan_duration_weeks=8,
+                           sport_limits={"swimming": {"sessions": 6, "lock_sessions": True}})
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    recovery_weeks = [w for w in plan["weeks"] if w["week_type"] == "recovery"]
+    assert recovery_weeks, "expected at least one recovery week"
+    for week in recovery_weeks:
+        assert len(sessions_by_day(week, "swimming")) < 6, week["week_number"]
+
+
+# --- Norwegian method ---
+
+def test_norwegian_eligibility_requires_hours_week_type_and_ramp_stability():
+    profile = {"training_style": "norwegian", "weekly_hours": 14}
+    assert norwegian_method_eligible(profile, 1.0, 1.0, "build")
+    assert not norwegian_method_eligible(
+        {"training_style": "standard", "weekly_hours": 14}, 1.0, 1.0, "build",
+    ), "only fires when the athlete opted in"
+    assert not norwegian_method_eligible(profile, 1.0, 1.0, "recovery")
+    assert not norwegian_method_eligible(profile, 1.0, 1.0, "taper")
+    assert not norwegian_method_eligible(
+        {**profile, "weekly_hours": 8}, 1.0, 1.0, "build",
+    ), "below the weekly-hours floor"
+    assert not norwegian_method_eligible(profile, 0.5, 1.0, "build"), \
+        "should not stack on an active ramp"
+    assert norwegian_method_eligible(profile, 0.96, 1.0, "build"), \
+        "within 0.95x peak counts as stable"
+
+
+def test_norwegian_double_threshold_placement_is_bounded_and_spaced():
+    profile = make_profile(
+        weekly_hours=16, sports=["cycling", "running", "swimming"],
+        max_sessions_per_day=2, training_style="norwegian",
+        plan_duration_weeks=6,
+    )
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    found_any = False
+    for week in plan["weeks"]:
+        double_days = sorted(
+            DAY_ORDER.index(d["day"]) for d in week["days"]
+            for w in d["workouts"] if w.get("workout_type") == "sub_threshold"
+        )
+        assert len(double_days) <= NORWEGIAN_DOUBLE_THRESHOLD_DAYS_PER_WEEK, week["week_number"]
+        for a, b in zip(double_days, double_days[1:]):
+            assert b - a >= MIN_DAYS_BETWEEN_DOUBLE_THRESHOLD, week["week_number"]
+        if double_days:
+            found_any = True
+    assert found_any, "expected at least one double-threshold week in a 16h/wk norwegian block"
+
+
+def test_norwegian_never_doubles_running_the_same_day():
+    profile = make_profile(
+        weekly_hours=18, sports=["running", "cycling"], max_sessions_per_day=2,
+        training_style="norwegian", plan_duration_weeks=6,
+    )
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    for week in plan["weeks"]:
+        for day in week["days"]:
+            running_sessions = [
+                w for w in day["workouts"]
+                if w["sport"] == "running" and w["workout_type"] != "rest"
+            ]
+            assert len(running_sessions) <= 1, (week["week_number"], day["day"])
+
+
+def test_norwegian_does_not_run_in_a_recovery_or_taper_week():
+    profile = make_profile(
+        weekly_hours=16, sports=["cycling", "running", "swimming"],
+        max_sessions_per_day=2, training_style="norwegian",
+        plan_duration_weeks=8, goal_event="olympic_triathlon",
+    )
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    for week in plan["weeks"]:
+        if week["week_type"] not in ("recovery", "taper"):
+            continue
+        for day in week["days"]:
+            assert not any(w.get("workout_type") == "sub_threshold" for w in day["workouts"])
+
+
+def test_below_the_hours_floor_norwegian_style_produces_no_double_threshold_days():
+    profile = make_profile(weekly_hours=8, training_style="norwegian",
+                           max_sessions_per_day=2)
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    for week in plan["weeks"]:
+        for day in week["days"]:
+            assert not any(w.get("workout_type") == "sub_threshold" for w in day["workouts"])

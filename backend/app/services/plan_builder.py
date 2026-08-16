@@ -40,6 +40,10 @@ ZONE_DEFINITIONS = {
     "endurance": {"pct_ftp": (0.56, 0.75), "rpe": "2-3", "zone": "Zone 2"},
     "tempo": {"pct_ftp": (0.76, 0.87), "rpe": "4-5", "zone": "Zone 3"},
     "sweetspot": {"pct_ftp": (0.88, 0.94), "rpe": "5-6", "zone": "Zone 3-4"},
+    # Norwegian-style "sub-threshold" — deliberately just under threshold so
+    # it can be repeated twice in a day without the accumulated fatigue of
+    # true threshold work. Overlaps sweetspot's top end by design.
+    "sub_threshold": {"pct_ftp": (0.90, 0.95), "rpe": "5-6", "zone": "Zone 3-4"},
     "threshold": {"pct_ftp": (0.95, 1.05), "rpe": "6-7", "zone": "Zone 4"},
     "vo2max": {"pct_ftp": (1.06, 1.20), "rpe": "8-9", "zone": "Zone 5"},
     "anaerobic": {"pct_ftp": (1.21, 1.50), "rpe": "9-10", "zone": "Zone 6"},
@@ -47,21 +51,22 @@ ZONE_DEFINITIONS = {
 
 SPORT_SPEEDS = {
     "cycling": {
-        "endurance": 28, "tempo": 30, "sweetspot": 31, "threshold": 33,
-        "vo2max": 28, "anaerobic": 25, "recovery": 24, "easy": 26,
+        "endurance": 28, "tempo": 30, "sweetspot": 31, "sub_threshold": 32,
+        "threshold": 33, "vo2max": 28, "anaerobic": 25, "recovery": 24, "easy": 26,
     },
     "running": {
-        "endurance": 10.5, "tempo": 12.0, "sweetspot": 12.5, "threshold": 13.5,
-        "vo2max": 11.0, "anaerobic": 10.0, "recovery": 9.0, "easy": 10.0,
+        "endurance": 10.5, "tempo": 12.0, "sweetspot": 12.5, "sub_threshold": 13.0,
+        "threshold": 13.5, "vo2max": 11.0, "anaerobic": 10.0, "recovery": 9.0, "easy": 10.0,
     },
     "swimming": {
-        "endurance": 2.8, "tempo": 3.0, "sweetspot": 3.1, "threshold": 3.3,
-        "vo2max": 3.0, "anaerobic": 2.8, "recovery": 2.5, "easy": 2.6,
+        "endurance": 2.8, "tempo": 3.0, "sweetspot": 3.1, "sub_threshold": 3.2,
+        "threshold": 3.3, "vo2max": 3.0, "anaerobic": 2.8, "recovery": 2.5, "easy": 2.6,
     },
 }
 
 IF_TABLE = {
     "recovery": 0.55, "endurance": 0.65, "tempo": 0.82, "sweetspot": 0.90,
+    "sub_threshold": 0.92,
     "threshold": 0.98, "vo2max": 0.95, "anaerobic": 0.85, "easy": 0.60,
     "strength": 0.50, "rest": 0.0,
 }
@@ -321,11 +326,27 @@ def requested_sessions(sport: str, limits: dict | None = None) -> int | None:
     return wanted if wanted > 0 else None
 
 
-def _scale_requested(requested: dict[str, int], scale: float) -> dict[str, int]:
-    """Shrink stated weekly counts for a lighter week, never below one."""
+def _scale_requested(requested: dict[str, int], scale: float,
+                     locked: set[str] | None = None,
+                     week_type: str = "build") -> dict[str, int]:
+    """Shrink stated weekly counts for a lighter week, never below one.
+
+    A discipline the athlete locked (`sport_limits[sport].lock_sessions`)
+    holds its exact stated count through every ramp/build week instead of
+    scaling down — that is the point of locking it. Recovery and taper weeks
+    still scale it down regardless: a lock is a frequency preference, not a
+    safety override.
+    """
     if not requested or scale >= 0.95:
         return dict(requested)
-    return {sport: max(1, round(n * scale)) for sport, n in requested.items()}
+    locked = locked or set()
+    scaled = {}
+    for sport, n in requested.items():
+        if sport in locked and week_type not in ("recovery", "taper"):
+            scaled[sport] = n
+        else:
+            scaled[sport] = max(1, round(n * scale))
+    return scaled
 
 
 def _sport_ceiling(sport: str, limits: dict | None = None) -> int:
@@ -488,8 +509,131 @@ def compute_training_density(weekly_hours: float,
     }
 
 
-def compute_recovery_schedule(total_weeks: int,
-                              experience: str) -> list[str]:
+# --- Norwegian method (double-threshold days) ---
+# Implementing the core mechanics from the training-science spec; the "6
+# weeks of prior threshold volume" recommendation is a soft UI-level gate
+# rather than a hard backend refusal — this is a single-user app, and the
+# athlete knows their own training background better than sync data can
+# infer it. The guards below are the ones the backend enforces unconditionally.
+
+NORWEGIAN_MIN_WEEKLY_HOURS = 12
+NORWEGIAN_DOUBLE_THRESHOLD_DAYS_PER_WEEK = 2
+MIN_DAYS_BETWEEN_DOUBLE_THRESHOLD = 2
+SUB_THRESHOLD_REST_MINUTES = 1
+PM_SHAKEOUT_MINUTES = (30, 40)
+
+
+def norwegian_method_eligible(profile: dict, week_multiplier: float,
+                              peak_multiplier: float, week_type: str) -> bool:
+    """Hard backend guards for double-threshold training.
+
+    These always apply when training_style == "norwegian" — opting into the
+    method does not opt out of the volume floor, running it through a
+    cutback week, or stacking it on top of an active ramp.
+    """
+    if profile.get("training_style") != "norwegian":
+        return False
+    if profile.get("weekly_hours", 0) < NORWEGIAN_MIN_WEEKLY_HOURS:
+        return False
+    if week_type in ("recovery", "taper"):
+        return False
+    if peak_multiplier <= 0 or week_multiplier < 0.95 * peak_multiplier:
+        return False
+    return True
+
+
+def _norwegian_shakeout_sport(sports: list[str], am_sport: str) -> str | None:
+    """Lowest-stress discipline available for the PM shakeout.
+
+    Running must never get doubled same-day, so if the AM double-threshold
+    session is a run, the PM shakeout has to be a different, cheaper sport.
+    """
+    candidates = [s for s in sports if s != "strength" and s != am_sport]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda s: SPORT_PROPERTIES.get(s, {}).get("stress_factor", 1.0))
+
+
+def _apply_norwegian_double_threshold(slots: list[dict], sports: list[str],
+                                      long_day: str | None,
+                                      max_sessions_per_day: int,
+                                      limits: dict | None = None) -> list[dict]:
+    """Restructure up to NORWEGIAN_DOUBLE_THRESHOLD_DAYS_PER_WEEK quality days
+    into AM sub-threshold / PM shakeout pairs, and return the new PM slots.
+
+    This does not raise compute_quality_sessions' ceiling — it reshapes
+    existing quality slots (tagging them "sub_threshold" in place) rather
+    than adding new ones. The PM shakeouts are genuinely net-new sessions, so
+    each is checked against the destination sport's weekly ceiling and the
+    day's max_sessions_per_day before being added.
+    """
+    quality_slots = sorted(
+        (s for s in slots if s["archetype"] == "quality"),
+        key=lambda s: DAY_ORDER.index(s["day"]),
+    )
+    chosen: list[dict] = []
+    for slot in quality_slots:
+        if slot["day"] == long_day:
+            continue
+        if any(abs(DAY_ORDER.index(slot["day"]) - DAY_ORDER.index(c["day"]))
+               < MIN_DAYS_BETWEEN_DOUBLE_THRESHOLD for c in chosen):
+            continue
+        chosen.append(slot)
+        if len(chosen) >= NORWEGIAN_DOUBLE_THRESHOLD_DAYS_PER_WEEK:
+            break
+
+    for slot in chosen:
+        slot["workout_type"] = "sub_threshold"
+
+    if max_sessions_per_day < 2:
+        # Nowhere to put the PM shakeout on the same day — the AM session
+        # still gets restructured to sub-threshold above, just without a
+        # double.
+        return []
+
+    day_counts: dict[str, int] = {}
+    sport_counts: dict[str, int] = {}
+    for s in slots:
+        day_counts[s["day"]] = day_counts.get(s["day"], 0) + 1
+        sport_counts[s["sport"]] = sport_counts.get(s["sport"], 0) + 1
+
+    extra: list[dict] = []
+    for slot in chosen:
+        if day_counts.get(slot["day"], 0) >= max_sessions_per_day:
+            continue
+        pm_sport = _norwegian_shakeout_sport(sports, slot["sport"])
+        if not pm_sport:
+            continue
+        ceiling = _sport_ceiling(pm_sport, limits)
+        if sport_counts.get(pm_sport, 0) >= ceiling:
+            continue
+        max_pm = SPORT_PROPERTIES.get(pm_sport, {}).get("max_session_minutes", 60)
+        duration = min(max_pm, _round_duration(sum(PM_SHAKEOUT_MINUTES) / 2))
+        extra.append({
+            "day": slot["day"], "sport": pm_sport, "archetype": "easy",
+            "workout_type": "recovery", "duration": duration,
+            "norwegian": "shakeout_pm",
+        })
+        day_counts[slot["day"]] = day_counts.get(slot["day"], 0) + 1
+        sport_counts[pm_sport] = sport_counts.get(pm_sport, 0) + 1
+
+    return extra
+
+
+# An "extended" recovery cycle is still bounded — an athlete who wants to
+# push the cadence out cannot ask for an unbounded run of build weeks, only a
+# longer one.
+MAX_RECOVERY_CYCLE_EXTENSION_WEEKS = 8
+
+# Independent of recovery_mode: this many consecutive build weeks always
+# forces a recovery week, even under "off". Bounded, not a true disable — see
+# compute_recovery_schedule.
+MAX_CONSECUTIVE_BUILD_WEEKS = {"beginner": 6, "intermediate": 8, "advanced": 10}
+
+
+def compute_recovery_schedule(total_weeks: int, experience: str,
+                              recovery_mode: str = "auto",
+                              recovery_cycle_weeks: int | None = None) -> list[str]:
     """Plan recovery weeks with a 20-40% volume reduction.
 
     Beginners: every 4 weeks (3 build + 1 recovery)
@@ -499,22 +643,52 @@ def compute_recovery_schedule(total_weeks: int,
     Cutting back every third week costs more fitness than it saves for anyone
     past their first season — the point of a recovery week is to absorb
     accumulated load, and at moderate volume that load takes longer to build.
+
+    `recovery_mode` lets the athlete opt out of the default cadence, but not
+    out of recovery altogether:
+      "auto"     - the experience-derived cycle above (unchanged behavior).
+      "extended" - `recovery_cycle_weeks` (clamped to
+                   MAX_RECOVERY_CYCLE_EXTENSION_WEEKS) replaces the
+                   experience-derived build count.
+      "off"      - no periodic recovery week at all.
+    Whatever the mode, MAX_CONSECUTIVE_BUILD_WEEKS is enforced afterward as a
+    hard ceiling — "off" combined with a long total_weeks cannot bypass it.
     """
     if experience == "beginner":
-        build_count = 3
+        default_build = 3
     elif experience == "advanced":
-        build_count = 5
+        default_build = 5
     else:
-        build_count = 4
+        default_build = 4
 
-    cycle = build_count + 1
+    if recovery_mode == "extended" and recovery_cycle_weeks:
+        build_count = max(1, min(int(recovery_cycle_weeks), MAX_RECOVERY_CYCLE_EXTENSION_WEEKS))
+    else:
+        build_count = default_build
+
     week_types = []
-    for i in range(total_weeks):
-        pos_in_cycle = i % cycle
-        if pos_in_cycle >= build_count:
-            week_types.append("recovery")
+    if recovery_mode == "off":
+        week_types = ["build"] * total_weeks
+    else:
+        cycle = build_count + 1
+        for i in range(total_weeks):
+            pos_in_cycle = i % cycle
+            week_types.append("recovery" if pos_in_cycle >= build_count else "build")
+
+    # Hard ceiling, independent of mode. "auto"/"extended" cycles are already
+    # well under it in the normal case, so this is a no-op there — it only
+    # bites when "off" (or a long extended cycle) would otherwise let build
+    # weeks run unchecked.
+    ceiling = MAX_CONSECUTIVE_BUILD_WEEKS.get(experience, MAX_CONSECUTIVE_BUILD_WEEKS["intermediate"])
+    streak = 0
+    for i, week_type in enumerate(week_types):
+        if week_type == "recovery":
+            streak = 0
         else:
-            week_types.append("build")
+            streak += 1
+            if streak > ceiling:
+                week_types[i] = "recovery"
+                streak = 0
 
     return week_types
 
@@ -596,12 +770,17 @@ def compute_readiness(fitness_context: dict | None) -> dict:
 
 def _assess_progression(multipliers: list[float], week_types: list[str],
                         weekly_hours: float, current_hours: float | None,
-                        experience: str) -> dict:
+                        experience: str, mode: str = "ramp") -> dict:
     """Describe the block's volume ramp, and say so when it cannot reach the top.
 
     Progressing faster than the safe weekly increase is not an option, so a
     block that is too short to bridge the gap should say that plainly rather
     than quietly under-delivering on the athlete's stated hours.
+
+    "steady" mode never intends to reach the full weekly_hours ceiling — it
+    ramps in briefly then holds flat near current volume — so a note there
+    describes the ramp-in/hold split rather than treating the flat hold as a
+    shortfall to be closed.
     """
     build = [m for m, t in zip(multipliers, week_types) if t not in ("recovery", "taper")]
     if not build:
@@ -618,6 +797,28 @@ def _assess_progression(multipliers: list[float], week_types: list[str],
         ),
         "reaches_target": max(build) >= 0.98,
     }
+
+    if mode == "steady":
+        if not assessment["reaches_target"]:
+            ramp_in = min(MIN_RAMP_IN_WEEKS, len(build))
+            history_note = (
+                f"{STEADY_MODE_MAX_JUMP_FROM_HISTORY}x your current "
+                f"{round(current_hours, 1)}h/week" if current_hours
+                else "a multiple of your recent training load"
+            )
+            assessment["note"] = (
+                f"Steady mode ramps in over the first {ramp_in} weeks to "
+                f"{peak_hours}h/week and holds there — capped at {history_note} "
+                f"rather than jumping straight to the full {weekly_hours}h."
+            )
+        if len(build) > MAX_STEADY_BLOCK_WEEKS:
+            extra = (
+                f"This block holds {len(build)} consecutive weeks of steady volume — "
+                "switch back to ramp mode, or restate weekly_hours, if you want it "
+                "to keep progressing."
+            )
+            assessment["note"] = f"{assessment['note']} {extra}" if assessment.get("note") else extra
+        return assessment
 
     if not assessment["reaches_target"]:
         weeks_needed = 0
@@ -657,9 +858,25 @@ DEFAULT_MAX_INCREASE = 0.10
 # told us the time is available; starting much lower wastes the block.
 MIN_START_FRACTION = 0.85
 
+# Steady mode: how many build weeks the normal ramp-in formula gets before the
+# multiplier holds flat.
+MIN_RAMP_IN_WEEKS = 3
+
+# Steady mode's flat level can never exceed this multiple of the athlete's
+# current volume — it holds near what they are already doing, it does not
+# jump to an untested target. Mirrors compliance.MAX_VOLUME_FACTOR (the same
+# 1.15x bound on a single adaptation); plan_builder does not import
+# compliance.py, so keep the two numbers in sync by hand if either changes.
+STEADY_MODE_MAX_JUMP_FROM_HISTORY = 1.15
+
+# Past this many consecutive steady weeks, _assess_progression adds a soft
+# note suggesting the athlete switch back to ramp or restate weekly_hours.
+MAX_STEADY_BLOCK_WEEKS = 8
+
 
 def compute_volume_progression(week_types: list[str], experience: str,
-                               start_fraction: float | None = None) -> list[float]:
+                               start_fraction: float | None = None,
+                               mode: str = "ramp") -> list[float]:
     """Progressive overload across the block.
 
     The athlete's stated weekly hours is the time they actually have, so it is
@@ -669,9 +886,19 @@ def compute_volume_progression(week_types: list[str], experience: str,
     solved so that the LAST build week lands on the ceiling. A fixed step would
     either top out in week 5 of a 20-week plan and then repeat the same week
     fourteen times, or never reach the athlete's hours at all in a 4-week block.
+
+    `mode="steady"` holds volume flat instead of ramping to the ceiling: it
+    ramps in for MIN_RAMP_IN_WEEKS using the same start/step formula, then
+    holds there, bounded by STEADY_MODE_MAX_JUMP_FROM_HISTORY x the athlete's
+    current volume (`start_fraction`, before any readiness discount). There is
+    nothing to bound the flat level against without a known starting volume,
+    so with `start_fraction=None` this silently behaves like "ramp".
     """
     build_weeks = sum(1 for w in week_types if w not in ("recovery", "taper"))
     max_step = MAX_WEEKLY_INCREASE.get(experience, DEFAULT_MAX_INCREASE)
+
+    if mode == "steady" and start_fraction is None:
+        mode = "ramp"
 
     if start_fraction is not None:
         start = min(max(start_fraction, 0.4), 1.0)
@@ -686,6 +913,31 @@ def compute_volume_progression(week_types: list[str], experience: str,
         step = min(max_step, (1.0 / start) ** (1 / (build_weeks - 1)) - 1)
     else:
         step = 0.0
+
+    if mode == "steady":
+        # Guard against the 0.4 "not absurdly easy" floor above landing above
+        # the history-relative ceiling for an athlete starting from very low
+        # current volume — the ceiling should never be below where the block
+        # is allowed to open.
+        ceiling = max(start, min(1.0, start_fraction * STEADY_MODE_MAX_JUMP_FROM_HISTORY))
+        ramp_in_weeks = min(MIN_RAMP_IN_WEEKS, build_weeks)
+
+        level = start
+        multipliers = []
+        build_i = 0
+        for week_type in week_types:
+            if week_type in ("recovery", "taper"):
+                multipliers.append(round(level * compute_volume_reduction(week_type, experience), 3))
+                continue
+            multipliers.append(round(level, 3))
+            if level < ceiling:
+                # First few weeks use the fitted ramp-in step; if the ceiling
+                # is not reached by then, keep stepping at the safe weekly
+                # increase until it is, then hold flat.
+                this_step = step if build_i < ramp_in_weeks - 1 else max_step
+                level = min(level * (1 + this_step), ceiling)
+            build_i += 1
+        return multipliers
 
     level = start
     multipliers = []
@@ -754,9 +1006,10 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
 
     Returns a flat list of {day, sport} slots — more than one per day once the
     volume calls for it. Session counts come from the frequency model, so this
-    only decides placement: quality days go to different disciplines, weekend
-    days to whichever sport carries the longest session, and second sessions
-    land on the lightest non-quality days in a different sport from the first.
+    only decides placement: an athlete's explicit long-session day claims its
+    day first, quality days then go to different disciplines, weekend days to
+    whichever sport carries the longest session, and second sessions land on
+    the lightest non-quality days in a different sport from the first.
     """
     real_sports = [s for s in sports if s != "strength"]
     if not real_sports:
@@ -785,9 +1038,31 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
         day_sports.setdefault(day, set()).add(sport)
         remaining[sport] -= 1
 
-    # 1. Quality days — one per discipline where possible.
+    # 1. Explicit long-session days (sport_limits[sport].long_day) claim their
+    # day first. This has to run before the quality-day pass below — an
+    # explicit pin is a more specific request than the generic quality/hard-day
+    # rotation, so it must not be able to lose its day to whichever sport wins
+    # that step's tie-break. A day still in day_sports afterward is what keeps
+    # every later step from also giving it to someone else.
+    pinned_long_days: dict[str, str] = {}
+    for sport in real_sports:
+        day = (limits or {}).get(sport, {}).get("long_day")
+        if not day or day not in training_days:
+            continue
+        if not allowed(sport, day):
+            continue  # a day restriction (pool hours etc.) still wins
+        occupants = day_sports.get(day, set())
+        if remaining.get(sport, 0) > 0 and len(occupants) < max_sessions_per_day:
+            place(sport, day)
+            pinned_long_days[sport] = day
+
+    # 2. Quality days — one per discipline where possible. Skips a day a pin
+    # above already filled to capacity, so an explicit long-day request is
+    # never bumped by the quality-day round robin.
     quality_used: set[str] = set()
     for day in quality_days:
+        if len(day_sports.get(day, set())) >= max_sessions_per_day:
+            continue
         available = usable(day)
         if not available:
             continue
@@ -796,7 +1071,7 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
         quality_used.add(pick)
         place(pick, day)
 
-    # 2. Weekends carry the long sessions.
+    # 3. Weekends carry the long sessions.
     leftover = [d for d in easy_days if d not in day_sports]
     weekend_used: set[str] = set()
     for day in ("saturday", "sunday"):
@@ -814,7 +1089,7 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
         place(pick, day)
         leftover.remove(day)
 
-    # 3. One session on each remaining day, avoiding the same sport two days
+    # 4. One session on each remaining day, avoiding the same sport two days
     #    running.
     for day in leftover:
         available = usable(day)
@@ -824,7 +1099,7 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
         spaced = [s for s in available if s not in previous] or available
         place(max(spaced, key=lambda s: remaining[s]), day)
 
-    # 4. Anything still owed becomes a second session. These go on the days
+    # 5. Anything still owed becomes a second session. These go on the days
     #    carrying the least so far, and never double up the same discipline.
     if max_sessions_per_day > 1:
         guard = 0
@@ -854,11 +1129,20 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
 
 
 def _assign_archetypes(schedule: list[dict], quality_days: list[str],
-                       long_session_essential: bool) -> list[dict]:
+                       long_session_essential: bool,
+                       limits: dict | None = None) -> list[dict]:
     """Tag each placed session with its archetype.
 
     Only the first session of a quality day is a quality session — a second
     session that day is there to add easy volume, not more intensity.
+
+    `limits[sport].long_day` pins which day a discipline's long session lands
+    on, honored before the generic weekend heuristic runs. Disciplines
+    without a pin then avoid a day another sport has already claimed as its
+    long day when an alternative exists — this is what stops two disciplines
+    both landing their long session on the same day by accident. Two sports
+    only end up sharing a day if the athlete explicitly pinned both to it, or
+    no alternative day is available.
     """
     slots = []
     quality_taken: set[str] = set()
@@ -876,17 +1160,46 @@ def _assign_archetypes(schedule: list[dict], quality_days: list[str],
     for slot in slots:
         by_sport.setdefault(slot["sport"], []).append(slot)
 
-    for sport, sport_slots in by_sport.items():
+    eligible_sports = {
+        sport: sport_slots for sport, sport_slots in by_sport.items()
         # Swimming gains more from frequency than from one long swim.
-        if SPORT_PROPERTIES.get(sport, {}).get("frequency_priority"):
+        if not SPORT_PROPERTIES.get(sport, {}).get("frequency_priority")
+    }
+
+    claimed_long_days: set[str] = set()
+
+    # Pinned days first, so a generic pick below cannot steal one out from
+    # under an explicit request.
+    for sport, sport_slots in eligible_sports.items():
+        pinned_day = (limits or {}).get(sport, {}).get("long_day")
+        if not pinned_day:
             continue
+        # A quality-tagged slot on the pinned day is still eligible: an
+        # explicit long_day pin is a more specific request than the generic
+        # quality-day rotation, so it wins even if that day also happens to
+        # be a preferred hard day. The week simply has one fewer quality slot
+        # that day instead of silently dropping the athlete's day choice.
+        match = next((s for s in sport_slots if s["day"] == pinned_day), None)
+        if match:
+            match["archetype"] = "long"
+            claimed_long_days.add(pinned_day)
+
+    for sport, sport_slots in eligible_sports.items():
+        if any(s["archetype"] == "long" for s in sport_slots):
+            continue  # already pinned above
         easy_slots = [s for s in sport_slots if s["archetype"] == "easy"]
         if not easy_slots:
             continue
         if len(easy_slots) == 1 and not long_session_essential:
             continue
         weekend = [s for s in easy_slots if s["day"] in ("saturday", "sunday")]
-        (weekend[-1] if weekend else easy_slots[-1])["archetype"] = "long"
+        candidates = weekend or easy_slots
+        # Prefer a day nobody else's long session already claimed, if there
+        # is an alternative.
+        free = [s for s in candidates if s["day"] not in claimed_long_days]
+        pick = (free or candidates)[-1]
+        pick["archetype"] = "long"
+        claimed_long_days.add(pick["day"])
 
     return slots
 
@@ -1083,6 +1396,16 @@ INTERVAL_VARIATIONS = {
         {"block": 5, "rest": 5, "power": 1.10, "cadence": 92, "name": "5min VO2max"},
         {"block": 2, "rest": 2, "power": 1.18, "cadence": 100, "name": "2min VO2max bursts"},
     ],
+    # Norwegian-style double-threshold AM session: short rest so the athlete
+    # stays right under threshold instead of recovering enough to push over it.
+    "sub_threshold": [
+        {"block": 15, "rest": SUB_THRESHOLD_REST_MINUTES, "power": 0.92, "cadence": 88,
+         "name": "15min sub-threshold"},
+        {"block": 20, "rest": SUB_THRESHOLD_REST_MINUTES, "power": 0.91, "cadence": 88,
+         "name": "20min sub-threshold"},
+        {"block": 10, "rest": SUB_THRESHOLD_REST_MINUTES, "power": 0.93, "cadence": 90,
+         "name": "10min sub-threshold"},
+    ],
 }
 
 
@@ -1095,6 +1418,7 @@ RUN_SPEED_FRACTIONS = {
     "easy": 0.78,
     "tempo": 0.88,
     "sweetspot": 0.93,
+    "sub_threshold": 0.965,
     "threshold": 1.00,
     "vo2max": 1.06,
     "anaerobic": 1.15,
@@ -1127,6 +1451,7 @@ RUN_EFFORT_CUES = {
     "endurance": "conversational pace — you should be able to speak in full sentences",
     "tempo": "comfortably hard, marathon-to-half-marathon effort (RPE 5-6)",
     "sweetspot": "just below threshold, ~half-marathon effort (RPE 6)",
+    "sub_threshold": "just under threshold — controlled, repeatable twice today (RPE 5-6)",
     "threshold": "10K-to-hour race effort — controlled discomfort (RPE 7)",
     "vo2max": "3K-to-5K race effort — hard, breathing heavy (RPE 8-9)",
     "anaerobic": "near-maximal, form-focused sprints (RPE 10)",
@@ -1325,7 +1650,7 @@ def _build_swim_steps(workout_type: str, duration: int, variation_seed: int = 0,
          "notes": f"Technique: {drill} — {drill_m}m of drill work, form over speed"},
     ]
 
-    if workout_type in ("threshold", "vo2max", "sweetspot", "tempo"):
+    if workout_type in ("threshold", "vo2max", "sweetspot", "sub_threshold", "tempo"):
         main_set = SWIM_MAIN_SETS[variation_seed % len(SWIM_MAIN_SETS)]
         pace_per_100 = swim_pace_seconds(main_set["pace"], css_pace)
         rep_secs = int(round(pace_per_100 * main_set["dist"] / 100 / 5) * 5)
@@ -1534,6 +1859,7 @@ SWIM_ZONE_LABELS = {
     "endurance": "Easy aerobic pace",
     "tempo": "Steady pace",
     "sweetspot": "Steady-to-threshold pace",
+    "sub_threshold": "Just under threshold pace",
     "threshold": "Threshold pace (CSS)",
     "vo2max": "Fast pace, short reps",
     "recovery": "Very easy, technique focus",
@@ -1574,7 +1900,7 @@ def _build_session(slot: dict, ftp: int, has_trainer: bool, seed: int,
     km = _estimate_distance(sport, workout_type, duration, threshold_pace, css_pace)
     suffix = " (long)" if archetype == "long" else ""
 
-    return {
+    workout = {
         "name": _workout_name(workout_type, sport, duration) + suffix,
         "sport": sport,
         "workout_type": workout_type,
@@ -1591,6 +1917,12 @@ def _build_session(slot: dict, ftp: int, has_trainer: bool, seed: int,
                                       seed, sport=sport,
                                       threshold_pace=threshold_pace, css_pace=css_pace),
     }
+    if slot.get("norwegian"):
+        # Marks the PM half of a Norwegian double-threshold pair so
+        # compliance.py can treat it as a logical unit with the AM session
+        # rather than a discipline that got dropped when it is skipped.
+        workout["norwegian"] = slot["norwegian"]
+    return workout
 
 
 def _workout_name(workout_type: str, sport: str, duration: int) -> str:
@@ -1598,6 +1930,7 @@ def _workout_name(workout_type: str, sport: str, duration: int) -> str:
         "endurance": "Endurance Ride" if sport == "cycling" else "Easy Run" if sport == "running" else "Steady Swim",
         "tempo": "Tempo Blocks",
         "sweetspot": "Sweet Spot Intervals",
+        "sub_threshold": "Sub-Threshold Intervals",
         "threshold": "Threshold Intervals",
         "vo2max": "VO2max Repeats",
         "anaerobic": "Sprint Intervals",
@@ -1702,7 +2035,19 @@ def build_plan(profile: dict, ftp: int,
     capacity = compute_capacity_assessment(weekly_hours, event, sports, experience)
     n_quality = compute_quality_sessions(weekly_hours, experience, capacity["strategy"])
     density = compute_training_density(weekly_hours, n_quality)
-    week_types = compute_recovery_schedule(total_weeks, experience)
+    week_types = compute_recovery_schedule(
+        total_weeks, experience,
+        profile.get("recovery_mode", "auto"), profile.get("recovery_cycle_weeks"),
+    )
+
+    # Reactive top-up for the week about to be built: arriving deeply
+    # fatigued forces this week to recovery even if recovery_mode says
+    # otherwise. This only fires once, at generation time — reactive
+    # mid-block recovery insertion from actual training data is
+    # compliance.py's job, not this function's.
+    if week_types and fitness_context and fitness_context.get("tsb") is not None \
+            and fitness_context["tsb"] <= TSB_BURIED:
+        week_types[0] = "recovery"
 
     # Race week is a taper. The week before it only becomes an extra recovery
     # week if the regular cycle has not already put one nearby — otherwise the
@@ -1733,6 +2078,12 @@ def build_plan(profile: dict, ftp: int,
         sport: n for sport in real_sports
         if (n := requested_sessions(sport, sport_limits))
     }
+    # Disciplines the athlete locked to their exact stated count — held flat
+    # through build weeks instead of scaling down with the ramp.
+    locked_sports = {
+        sport for sport in requested_per_sport
+        if (sport_limits.get(sport) or {}).get("lock_sessions")
+    }
 
     # Where the ramp starts. Synced history beats the onboarding slider, and an
     # explicit answer from the athlete beats both.
@@ -1746,15 +2097,31 @@ def build_plan(profile: dict, ftp: int,
     if start_fraction is not None:
         start_fraction *= readiness["multiplier"]
 
-    week_multipliers = compute_volume_progression(week_types, experience, start_fraction)
+    # Steady mode needs a real starting volume to bound the flat level
+    # against — with nothing to go on ("default" source), fall back to ramp.
+    volume_mode = profile.get("volume_progression_mode", "ramp")
+    if volume_mode == "steady" and volume_source == "default":
+        volume_mode = "ramp"
+
+    week_multipliers = compute_volume_progression(week_types, experience, start_fraction, volume_mode)
     progression = _assess_progression(week_multipliers, week_types, weekly_hours,
-                                      current_hours, experience)
+                                      current_hours, experience, volume_mode)
     progression["volume_source"] = volume_source
     if current_hours:
         progression["current_hours"] = round(current_hours, 1)
     if readiness.get("note"):
         progression["readiness_note"] = readiness["note"]
     progression["readiness"] = readiness["state"]
+
+    # Norwegian eligibility compares each week's multiplier against the
+    # block's peak build multiplier — it must not stack on top of an active
+    # ramp, only once the week is at (or very near) full volume.
+    build_multipliers = [
+        m for m, t in zip(week_multipliers, week_types) if t not in ("recovery", "taper")
+    ]
+    peak_multiplier = max(build_multipliers) if build_multipliers else (
+        max(week_multipliers) if week_multipliers else 1.0
+    )
 
     weeks = []
     for week_idx in range(total_weeks):
@@ -1820,6 +2187,7 @@ def build_plan(profile: dict, ftp: int,
         # under their useful minimum — the same rule the volume model uses.
         week_requested = _scale_requested(
             requested_per_sport, week_multipliers[week_idx] * partial_factor,
+            locked_sports, week_type,
         )
 
         session_target = compute_session_target(
@@ -1832,6 +2200,7 @@ def build_plan(profile: dict, ftp: int,
         )
         base_slots = _assign_archetypes(
             sport_schedule, week_quality_days, capacity["long_session_essential"],
+            sport_limits,
         )
         slots, unfitted = _allocate_slot_durations(base_slots, week_minutes, week_type)
 
@@ -1840,6 +2209,14 @@ def build_plan(profile: dict, ftp: int,
             slot["workout_type"] = (
                 quality_types[idx] if idx < len(quality_types) else "threshold"
             )
+
+        if norwegian_method_eligible(profile, week_multipliers[week_idx],
+                                     peak_multiplier, week_type):
+            long_slot = next((s for s in slots if s["archetype"] == "long"), None)
+            slots.extend(_apply_norwegian_double_threshold(
+                slots, real_sports, long_slot["day"] if long_slot else None,
+                max_sessions_per_day, sport_limits,
+            ))
 
         strength_days = _pick_strength_days(slots) if "strength" in sports else set()
         by_day: dict[str, list[dict]] = {}
@@ -1928,7 +2305,9 @@ def build_plan(profile: dict, ftp: int,
     }
 
     if requested_per_sport:
-        plan["session_targets"] = _session_frequency_report(weeks, requested_per_sport)
+        plan["session_targets"] = _session_frequency_report(
+            weeks, requested_per_sport, week_multipliers, peak_multiplier, volume_mode,
+        )
 
     safety_warnings = validate_plan(plan, profile)
     if safety_warnings:
@@ -1937,29 +2316,64 @@ def build_plan(profile: dict, ftp: int,
     return plan
 
 
-def _session_frequency_report(weeks: list[dict],
-                              requested: dict[str, int]) -> dict:
+def _session_frequency_report(weeks: list[dict], requested: dict[str, int],
+                              week_multipliers: list[float] | None = None,
+                              peak_multiplier: float | None = None,
+                              volume_mode: str = "ramp") -> dict:
     """Compare the frequency the athlete asked for against what got scheduled.
 
     A request can go unmet for honest reasons — not enough days, not enough
     hours to give every session a useful length, a per-sport day restriction.
     Say so rather than quietly handing back a different plan from the one they
     asked for.
+
+    `shortfall_expected` tells the frontend whether it needs to bother the
+    athlete about it: True means every week that fell short was a
+    recovery/taper week, or (in "ramp" mode only) a build week that had not
+    yet reached the block's peak volume — expected week-type scaling, not
+    something to act on. False means a shortfall showed up at the peak build
+    week, or at any build week in "steady" mode (which is not supposed to
+    keep climbing the way "ramp" does) — a real capacity mismatch the
+    athlete should do something about. Only present when there is a
+    shortfall at all (i.e. alongside `unmet`/`note`).
     """
     scheduled: dict[str, int] = {}
-    for week in weeks:
-        if week.get("week_type") not in ("build", None):
-            continue
+    # Whether each week that fell short of the ask, for any requested sport,
+    # is one where that shortfall is expected rather than real. Recovery and
+    # taper weeks are deliberately excluded from the `scheduled` aggregate
+    # above (only a build week describes the request) but are still examined
+    # here — a shortfall there is always expected.
+    shortfall_weeks_expected: list[bool] = []
+
+    for idx, week in enumerate(weeks):
+        week_type = week.get("week_type")
         counts: dict[str, int] = {}
         for day in week.get("days", []):
             for workout in day.get("workouts", []):
                 sport = workout.get("sport")
                 if sport in requested:
                     counts[sport] = counts.get(sport, 0) + 1
-        # The fullest build week is the one the request describes; earlier ramp
-        # weeks are deliberately smaller.
-        for sport, n in counts.items():
-            scheduled[sport] = max(scheduled.get(sport, 0), n)
+
+        if week_type in ("build", None):
+            # The fullest build week is the one the request describes;
+            # earlier ramp weeks are deliberately smaller.
+            for sport, n in counts.items():
+                scheduled[sport] = max(scheduled.get(sport, 0), n)
+
+        short_this_week = any(counts.get(sport, 0) < n for sport, n in requested.items())
+        if not short_this_week:
+            continue
+
+        if week_type in ("recovery", "taper"):
+            shortfall_weeks_expected.append(True)
+        elif (volume_mode == "ramp" and week_multipliers is not None
+              and peak_multiplier and idx < len(week_multipliers)):
+            shortfall_weeks_expected.append(week_multipliers[idx] < 0.98 * peak_multiplier)
+        else:
+            # Steady mode gets no ramp-week leniency (it is not supposed to
+            # keep climbing), and without multiplier context there is
+            # nothing to call "not yet at peak" — treat it as real.
+            shortfall_weeks_expected.append(False)
 
     shortfalls = {
         sport: {"requested": n, "scheduled": scheduled.get(sport, 0)}
@@ -1973,6 +2387,7 @@ def _session_frequency_report(weeks: list[dict],
             f"{sport}: asked for {v['requested']}/wk, scheduled {v['scheduled']}"
             for sport, v in sorted(shortfalls.items())
         )
+        report["shortfall_expected"] = bool(shortfall_weeks_expected) and all(shortfall_weeks_expected)
     return report
 
 

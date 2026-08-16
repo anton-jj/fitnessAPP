@@ -36,6 +36,10 @@ class ProfileUpdate(BaseModel):
     has_hr_monitor: Optional[bool] = None
     max_sessions_per_day: Optional[int] = None
     sport_limits: Optional[dict] = None
+    recovery_mode: Optional[str] = None
+    recovery_cycle_weeks: Optional[int] = None
+    volume_progression_mode: Optional[str] = None
+    training_style: Optional[str] = None
     auto_push: Optional[bool] = None
     notes: Optional[str] = None
     onboarding_complete: Optional[bool] = None
@@ -222,6 +226,10 @@ def _serialize(profile: AthleteProfile) -> dict:
         "has_hr_monitor": profile.has_hr_monitor,
         "max_sessions_per_day": profile.max_sessions_per_day or 1,
         "sport_limits": profile.sport_limits or {},
+        "recovery_mode": profile.recovery_mode or "auto",
+        "recovery_cycle_weeks": profile.recovery_cycle_weeks,
+        "volume_progression_mode": profile.volume_progression_mode or "ramp",
+        "training_style": profile.training_style or "standard",
         "auto_push": profile.auto_push,
         "notes": profile.notes,
         "onboarding_complete": profile.onboarding_complete,

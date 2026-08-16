@@ -48,8 +48,16 @@ SPORT_DROP_RATIO = 0.55
 
 def _planned_sessions(week: dict) -> list[dict]:
     return [
-        {"date": day["date"], "sport": w["sport"],
-         "minutes": w.get("duration_minutes", 0), "name": w.get("name", "")}
+        {
+            "date": day["date"], "sport": w["sport"],
+            "minutes": w.get("duration_minutes", 0), "name": w.get("name", ""),
+            # An AM/PM Norwegian double-threshold pair is one logical session
+            # for adherence purposes — counting the PM shakeout as its own
+            # planned session would make skipping an easy jog look like the
+            # discipline is being dropped, when the (harder) AM session still
+            # happened. Its minutes still count toward the week's volume.
+            "countable": w.get("norwegian") != "shakeout_pm",
+        }
         for day in week.get("days", [])
         if day.get("date")
         for w in day.get("workouts", [])
@@ -88,7 +96,8 @@ def _match(planned: list[dict], activities: list[Activity]) -> dict:
     for session in planned:
         sport = session["sport"]
         planned_minutes[sport] = planned_minutes.get(sport, 0) + session["minutes"]
-        planned_count[sport] = planned_count.get(sport, 0) + 1
+        if session.get("countable", True):
+            planned_count[sport] = planned_count.get(sport, 0) + 1
 
     sports = set(planned_minutes) | set(done_minutes)
     by_sport = {

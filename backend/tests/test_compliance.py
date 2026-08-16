@@ -6,6 +6,8 @@ import pytest
 
 from app.services.compliance import (
     MIN_VOLUME_FACTOR,
+    _match,
+    _planned_sessions,
     _recommend,
     adapt_remaining_weeks,
 )
@@ -110,6 +112,39 @@ def test_a_sport_being_done_is_never_dropped():
     }
     result = _recommend([summary(1.0, kept), summary(1.0, kept)])
     assert result["drop_sports"] == []
+
+
+# --- Norwegian PM shakeouts don't count as a dropped discipline ---
+
+def test_pm_shakeout_is_excluded_from_the_session_count():
+    """Skipping the easy PM jog should not read as the discipline being dropped
+    — the (harder) AM double-threshold session still counts."""
+    week_data = {
+        "days": [
+            {"date": "2026-08-10", "workouts": [
+                {"sport": "running", "workout_type": "sub_threshold",
+                 "duration_minutes": 40, "name": "AM double threshold"},
+                {"sport": "cycling", "workout_type": "recovery",
+                 "duration_minutes": 30, "name": "PM shakeout",
+                 "norwegian": "shakeout_pm"},
+            ]},
+        ],
+    }
+    planned = _planned_sessions(week_data)
+    assert len(planned) == 2, "both sessions are still tracked"
+    countable = [p for p in planned if p["countable"]]
+    assert [p["sport"] for p in countable] == ["running"]
+
+
+def test_pm_shakeout_minutes_still_count_toward_volume():
+    planned = [
+        {"date": "2026-08-10", "sport": "cycling", "minutes": 30,
+         "name": "PM shakeout", "countable": False},
+    ]
+    result = _match(planned, [])
+    assert result["by_sport"]["cycling"]["planned_minutes"] == 30
+    assert result["by_sport"]["cycling"]["planned_sessions"] == 0
+    assert result["planned_minutes"] == 30
 
 
 # --- Applying the adaptation ---

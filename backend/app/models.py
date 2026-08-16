@@ -149,6 +149,19 @@ class AthleteProfile(Base):
     # on those days. Constraints, not preferences — the planner must not
     # schedule training the athlete cannot physically do.
     sport_limits = Column(JSON)
+    # Recovery-week cadence: "auto" (experience-derived cycle), "extended"
+    # (athlete-chosen cycle length, see recovery_cycle_weeks), or "off" (no
+    # periodic recovery week — the consecutive-build-week ceiling in
+    # plan_builder still forces one, this only disables the regular cadence).
+    recovery_mode = Column(String, default="auto")
+    recovery_cycle_weeks = Column(Integer)  # only used when recovery_mode == "extended"
+    # "ramp": progressive overload to the stated weekly_hours (default).
+    # "steady": ramp in briefly, then hold volume flat — see
+    # plan_builder.compute_volume_progression for the history-relative cap.
+    volume_progression_mode = Column(String, default="ramp")
+    # "standard" (methodology-agnostic, the default) or "norwegian"
+    # (double-threshold days named and coached explicitly).
+    training_style = Column(String, default="standard")
     auto_push = Column(Boolean, default=False)  # auto-push workouts to watch daily
     notes = Column(Text)
     onboarding_complete = Column(Boolean, default=False)
