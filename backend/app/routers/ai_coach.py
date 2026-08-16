@@ -243,6 +243,25 @@ async def adjust_training_plan(plan_id: int, action: PlanAction, db: AsyncSessio
     }
 
 
+def _find_week(data: dict, week_number: int) -> dict | None:
+    weeks = data.get("weeks", [])
+    week = next((w for w in weeks if w.get("week_number") == week_number), None)
+    if week:
+        return week
+    return data if data.get("days") else None
+
+
+# Rebalance advice is informational only — nothing in the UI blocks on it, so
+# it runs after the response instead of holding the request open on an AI call.
+_advisory_tasks: set = set()
+
+
+def _fire_advisory(coro) -> None:
+    task = asyncio.create_task(coro)
+    _advisory_tasks.add(task)
+    task.add_done_callback(_advisory_tasks.discard)
+
+
 class MoveWorkoutRequest(BaseModel):
     plan_id: int
     week_number: int
@@ -253,25 +272,21 @@ class MoveWorkoutRequest(BaseModel):
 
 @router.post("/plan/move-workout")
 async def move_workout(req: MoveWorkoutRequest, db: AsyncSession = Depends(get_db)):
-    """Move a workout from one day to another within a week, then ask AI to rebalance."""
+    """Move a workout from one day to another within a week.
+
+    Purely a data move — no AI call is needed to decide the outcome, so this
+    commits and returns immediately. An advisory sanity-check still runs, but
+    in the background after the response, since nothing here depends on it.
+    """
     result = await db.execute(select(TrainingPlan).where(TrainingPlan.id == req.plan_id))
     plan = result.scalar_one_or_none()
     if not plan:
         raise HTTPException(404, "Plan not found")
 
     data = plan.plan_data
-    weeks = data.get("weeks", [])
-    week = None
-    for w in weeks:
-        if w.get("week_number") == req.week_number:
-            week = w
-            break
+    week = _find_week(data, req.week_number)
     if not week:
-        days_list = data.get("days", [])
-        if days_list:
-            week = data
-        else:
-            raise HTTPException(404, "Week not found")
+        raise HTTPException(404, "Week not found")
 
     from_day_data = None
     to_day_data = None
@@ -308,16 +323,63 @@ async def move_workout(req: MoveWorkoutRequest, db: AsyncSession = Depends(get_d
     flag_modified(plan, "plan_data")
     await db.commit()
 
-    advice = await _get_rebalance_advice(week, req.from_day, req.to_day, workout)
+    _fire_advisory(_log_rebalance_advice(week, req.from_day, req.to_day, workout))
 
-    return {
-        "moved": True,
-        "week": week,
-        "advice": advice,
-    }
+    return {"moved": True, "week": week}
 
 
-async def _get_rebalance_advice(week: dict, from_day: str, to_day: str, moved_workout: dict) -> str | None:
+class SwapWorkoutRequest(BaseModel):
+    plan_id: int
+    week_number: int
+    day_a: str
+    index_a: int
+    day_b: str
+    index_b: int
+
+
+@router.post("/plan/swap-workout")
+async def swap_workout(req: SwapWorkoutRequest, db: AsyncSession = Depends(get_db)):
+    """Swap two workouts between days.
+
+    Also a pure data operation (the two sessions and their prescriptions are
+    unchanged, only their day assignment trades places) — deterministic and
+    instant, same as move-workout above.
+    """
+    result = await db.execute(select(TrainingPlan).where(TrainingPlan.id == req.plan_id))
+    plan = result.scalar_one_or_none()
+    if not plan:
+        raise HTTPException(404, "Plan not found")
+
+    data = plan.plan_data
+    week = _find_week(data, req.week_number)
+    if not week:
+        raise HTTPException(404, "Week not found")
+
+    day_a = next((d for d in week.get("days", []) if d["day"] == req.day_a), None)
+    day_b = next((d for d in week.get("days", []) if d["day"] == req.day_b), None)
+    if not day_a or not day_b:
+        raise HTTPException(400, "Day not found")
+
+    workouts_a = day_a.get("workouts", [])
+    workouts_b = day_b.get("workouts", [])
+    if req.index_a >= len(workouts_a) or req.index_b >= len(workouts_b):
+        raise HTTPException(400, "Workout index out of range")
+
+    workouts_a[req.index_a], workouts_b[req.index_b] = (
+        workouts_b[req.index_b], workouts_a[req.index_a]
+    )
+
+    plan.plan_data = data
+    flag_modified(plan, "plan_data")
+    await db.commit()
+
+    _fire_advisory(_log_rebalance_advice(week, req.day_a, req.day_b, workouts_b[req.index_b]))
+
+    return {"swapped": True, "week": week}
+
+
+async def _log_rebalance_advice(week: dict, from_day: str, to_day: str, moved_workout: dict) -> None:
+    """Background sanity-check after a move/swap — logged only, nothing reads it yet."""
     from ..services.ai_coach import _generate
     summary_lines = [
         f"A workout was moved from {from_day} to {to_day}:",
@@ -346,11 +408,11 @@ async def _get_rebalance_advice(week: dict, from_day: str, to_day: str, moved_wo
     )
     try:
         result = await _generate(system, prompt, tier="light")
-        if result and isinstance(result, dict):
-            return result.get("advice", "")
+        advice = result.get("advice") if isinstance(result, dict) else None
+        if advice:
+            log.info(f"Post-move advisory ({from_day}->{to_day}): {advice}")
     except Exception:
-        pass
-    return None
+        log.exception("Post-move advisory check failed")
 
 
 class WorkoutPushRequest(BaseModel):

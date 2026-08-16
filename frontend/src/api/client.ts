@@ -106,10 +106,10 @@ export const api = {
     const q = week ? `?week=${week}` : ''
     return request<any>(`/ai/plan${q}`)
   },
-  adjustPlan: (planId: number, action: string, details: string) =>
+  adjustPlan: (planId: number, action: string, details: string, weekNumber?: number) =>
     request<any>(`/ai/plan/${planId}/adjust`, {
       method: 'POST',
-      body: JSON.stringify({ action, details }),
+      body: JSON.stringify({ action, details, week_number: weekNumber }),
     }),
   updatePlan: (planId: number, data: any) =>
     request<any>(`/ai/plan/${planId}`, { method: 'PUT', body: JSON.stringify(data) }),
@@ -118,6 +118,8 @@ export const api = {
 
   moveWorkout: (data: { plan_id: number; week_number: number; from_day: string; from_index: number; to_day: string }) =>
     request<any>('/ai/plan/move-workout', { method: 'POST', body: JSON.stringify(data) }),
+  swapWorkout: (data: { plan_id: number; week_number: number; day_a: string; index_a: number; day_b: string; index_b: number }) =>
+    request<any>('/ai/plan/swap-workout', { method: 'POST', body: JSON.stringify(data) }),
 
   pushToWatch: (workout: any, date: string) =>
     request<any>('/ai/push-to-watch', {

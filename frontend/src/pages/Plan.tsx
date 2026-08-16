@@ -143,6 +143,20 @@ function getWeeks(plan: any): any[] {
   return []
 }
 
+// Locates the live `days` array inside a plan payload so an optimistic swap
+// can mutate it directly, in whatever shape the plan actually uses
+// (multi-week `weeks[]`, or a single flat `days[]`) — mirrors getWeeks above
+// but returns a reference into the real object instead of a synthetic wrapper.
+function findWeekDays(planData: any, weekNumber: number): any[] | null {
+  if (planData?.weeks && Array.isArray(planData.weeks)) {
+    return planData.weeks.find((w: any) => w.week_number === weekNumber)?.days ?? null
+  }
+  if (planData?.days && Array.isArray(planData.days)) {
+    return planData.days
+  }
+  return null
+}
+
 export default function Plan() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
@@ -172,9 +186,40 @@ export default function Plan() {
   })
 
   const adjust = useMutation({
-    mutationFn: ({ action, details }: { action: string; details: string }) =>
-      api.adjustPlan(plan.id, action, details),
+    mutationFn: ({ action, details, week_number }: { action: string; details: string; week_number?: number }) =>
+      api.adjustPlan(plan.id, action, details, week_number),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['plan'] }),
+  })
+
+  // Swapping two workouts is a pure data move — no AI judgment call needed —
+  // so it applies instantly against the local cache and persists deterministically
+  // in the background, instead of paying for a slow full-week AI rewrite (the old
+  // path, which also silently always targeted week 1 regardless of which week the
+  // athlete was actually looking at).
+  const swapWorkout = useMutation({
+    mutationFn: (vars: { week_number: number; day_a: string; index_a: number; day_b: string; index_b: number }) =>
+      api.swapWorkout({ plan_id: plan.id, ...vars }),
+    onMutate: async (vars) => {
+      await queryClient.cancelQueries({ queryKey: ['plan'] })
+      const previous = queryClient.getQueryData(['plan'])
+      queryClient.setQueryData(['plan'], (old: any) => {
+        if (!old?.plan) return old
+        const next = structuredClone(old)
+        const days = findWeekDays(next.plan, vars.week_number)
+        const dayA = days?.find((d: any) => d.day === vars.day_a)
+        const dayB = days?.find((d: any) => d.day === vars.day_b)
+        const wa = dayA?.workouts
+        const wb = dayB?.workouts
+        if (!wa || !wb || vars.index_a >= wa.length || vars.index_b >= wb.length) return old
+        ;[wa[vars.index_a], wb[vars.index_b]] = [wb[vars.index_b], wa[vars.index_a]]
+        return next
+      })
+      return { previous }
+    },
+    onError: (_err, _vars, context) => {
+      if (context?.previous) queryClient.setQueryData(['plan'], context.previous)
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ['plan'] }),
   })
 
   const pushToWatch = useMutation({
@@ -608,9 +653,14 @@ export default function Plan() {
                                 isSwapTarget ? 'ring-1 ring-accent/50 cursor-pointer' : ''
                               }`}
                               onClick={() => {
-                                if (isSwapTarget && swapSource) {
-                                  const details = `Swap ${swapSource.day} workout ${swapSource.idx + 1} with ${day} workout ${idx + 1}`
-                                  adjust.mutate({ action: 'swap', details })
+                                if (isSwapTarget && swapSource && currentWeek?.week_number != null) {
+                                  swapWorkout.mutate({
+                                    week_number: currentWeek.week_number,
+                                    day_a: swapSource.day,
+                                    index_a: swapSource.idx,
+                                    day_b: day,
+                                    index_b: idx,
+                                  })
                                   setSwapSource(null)
                                 }
                               }}
@@ -680,7 +730,7 @@ export default function Plan() {
                                     onClick={(e) => {
                                       e.stopPropagation()
                                       const details = `Skip week ${currentWeek.week_number} ${day} workout: ${w.name}`
-                                      adjust.mutate({ action: 'skip', details })
+                                      adjust.mutate({ action: 'skip', details, week_number: currentWeek.week_number })
                                     }}
                                     className="p-1.5 rounded-lg hover:bg-danger/10 text-slate-500 hover:text-danger transition-colors"
                                     title="Skip this workout"

@@ -379,8 +379,16 @@ def _allocate_sport_sessions(real_sports: list[str], total_sessions: int,
     Disciplines the athlete gave an explicit weekly count are pinned to it and
     sit out the share-out; only the rest compete for what is left. If the week
     cannot hold every pinned count, the largest requests give up a session each
-    in turn rather than one discipline being starved to protect the others.
+    in turn rather than one discipline being starved to protect the others —
+    except a discipline the athlete explicitly locked (`lock_sessions`),
+    which never gives one up here: trimming an exact stated count back down
+    to fit a soft budget estimate is exactly the silent under-delivery a lock
+    exists to prevent. `_build_sport_schedule` is what actually finds room
+    for the honored count (including same-day doubling, capped at
+    MAX_SAME_SPORT_SESSIONS_PER_DAY), so this function only needs to not
+    throw the number away before it gets there.
     """
+    locked = {s for s in real_sports if (limits or {}).get(s, {}).get("lock_sessions")}
     pinned = {
         sport: min(n, _sport_ceiling(sport, limits))
         for sport, n in (requested or {}).items()
@@ -392,7 +400,10 @@ def _allocate_sport_sessions(real_sports: list[str], total_sessions: int,
     # pinned counts have to fit alongside.
     budget = max(total_sessions - len(free), len(pinned))
     while pinned and sum(pinned.values()) > budget:
-        biggest = max(pinned, key=lambda s: (pinned[s], s))
+        trimmable = {s: n for s, n in pinned.items() if s not in locked}
+        if not trimmable:
+            break  # everything left pinned is locked — honor it past budget
+        biggest = max(trimmable, key=lambda s: (trimmable[s], s))
         if pinned[biggest] <= 1:
             break
         pinned[biggest] -= 1
@@ -522,6 +533,18 @@ MIN_DAYS_BETWEEN_DOUBLE_THRESHOLD = 2
 SUB_THRESHOLD_REST_MINUTES = 1
 PM_SHAKEOUT_MINUTES = (30, 40)
 
+# What limits a beginner opting into double-threshold isn't fitness — the
+# hours floor and ramp-stability check above already gate that — it's pacing
+# discipline: staying controlled at 90-95% FTP with ~1min rest between reps
+# without drifting into a true threshold/VO2max effort. A pacing error on
+# one double-threshold day costs one day, not the week's whole balance, so a
+# beginner gets one such day instead of two; intermediate/advanced (already
+# training 12+ hours/week to be eligible at all) get the full method. Never
+# scaled by hours — an inexperienced athlete needs more buffer volume to
+# absorb the doubles, not less, so the flat NORWEGIAN_MIN_WEEKLY_HOURS stays
+# the same for everyone.
+NORWEGIAN_MAX_DOUBLE_DAYS_BY_EXPERIENCE = {"beginner": 1}
+
 
 def norwegian_method_eligible(profile: dict, week_multiplier: float,
                               peak_multiplier: float, week_type: str) -> bool:
@@ -529,7 +552,11 @@ def norwegian_method_eligible(profile: dict, week_multiplier: float,
 
     These always apply when training_style == "norwegian" — opting into the
     method does not opt out of the volume floor, running it through a
-    cutback week, or stacking it on top of an active ramp.
+    cutback week, or stacking it on top of an active ramp. Experience level
+    is deliberately NOT a gate here (see NORWEGIAN_MAX_DOUBLE_DAYS_BY_
+    EXPERIENCE below for how it's actually handled) — a beginner training
+    12+ hours/week is not blocked from opting in, just started on a single
+    double-threshold day instead of two.
     """
     if profile.get("training_style") != "norwegian":
         return False
@@ -573,7 +600,8 @@ def _apply_norwegian_double_threshold(slots: list[dict], sports: list[str],
                                       long_day: str | None,
                                       max_sessions_per_day: int,
                                       limits: dict | None = None,
-                                      week_requested: dict[str, int] | None = None
+                                      week_requested: dict[str, int] | None = None,
+                                      experience: str = "advanced",
                                       ) -> list[dict]:
     """Restructure up to NORWEGIAN_DOUBLE_THRESHOLD_DAYS_PER_WEEK quality days
     into AM sub-threshold / PM shakeout pairs, and return the new PM slots.
@@ -596,19 +624,28 @@ def _apply_norwegian_double_threshold(slots: list[dict], sports: list[str],
       `lock_sessions` sport is left at its requested count rather than
       quietly exceeded.
     """
+    days_cap = min(
+        NORWEGIAN_DOUBLE_THRESHOLD_DAYS_PER_WEEK,
+        NORWEGIAN_MAX_DOUBLE_DAYS_BY_EXPERIENCE.get(
+            experience, NORWEGIAN_DOUBLE_THRESHOLD_DAYS_PER_WEEK),
+    )
+
     quality_slots = sorted(
         (s for s in slots if s["archetype"] == "quality"),
         key=lambda s: DAY_ORDER.index(s["day"]),
     )
     chosen: list[dict] = []
     for slot in quality_slots:
-        if slot["day"] == long_day:
+        # Not the same day as the long session, and not adjacent to it either
+        # — stacking sub-threshold fatigue right next to the week's key long
+        # session defeats the point of protecting that session.
+        if long_day and abs(DAY_ORDER.index(slot["day"]) - DAY_ORDER.index(long_day)) <= 1:
             continue
         if any(abs(DAY_ORDER.index(slot["day"]) - DAY_ORDER.index(c["day"]))
                < MIN_DAYS_BETWEEN_DOUBLE_THRESHOLD for c in chosen):
             continue
         chosen.append(slot)
-        if len(chosen) >= NORWEGIAN_DOUBLE_THRESHOLD_DAYS_PER_WEEK:
+        if len(chosen) >= days_cap:
             break
 
     for slot in chosen:
@@ -682,6 +719,23 @@ MAX_CONSECUTIVE_WEEKS_ZERO_QUALITY_SWIM = 4
 # performance (holding pace in contact/chop) depends on recent rehearsal
 # more than accumulated base.
 PRE_RACE_SWIM_QUALITY_FLOOR_WEEKS = 6
+
+# When an athlete explicitly opts into quality-day stacking (a stated
+# quality_sport_priority — see build_plan), the top-ranked sport is allowed
+# to claim more than one quality day in the same week instead of the default
+# round-robin. Two hard days for the same discipline still need real
+# separation: this is the minimum day-gap between them, same value already
+# validated for Norwegian double-threshold spacing (MIN_DAYS_BETWEEN_
+# DOUBLE_THRESHOLD below) — reused rather than inventing a second number for
+# the same underlying "needs a full easy day to recover" rule.
+MIN_DAYS_BETWEEN_SAME_SPORT_QUALITY = 2
+
+# Same shape as MAX_CONSECUTIVE_WEEKS_ZERO_QUALITY_SWIM above: stacking is a
+# legitimate athlete preference, not a license to zero out another
+# discipline's intensity for a whole season. Past this many consecutive
+# weeks of one sport claiming every quality day, one week is forced back to
+# round-robin so the second-ranked sport gets a quality day too.
+MAX_CONSECUTIVE_WEEKS_SINGLE_SPORT_ALL_QUALITY = 6
 
 
 def compute_recovery_schedule(total_weeks: int, experience: str,
@@ -1007,9 +1061,20 @@ def compute_volume_progression(week_types: list[str], experience: str,
 
 MIN_ENDURANCE_DURATION = 45
 MIN_SESSION_DURATION = 30
+# Last-resort floor for a locked swim count that would not otherwise fit —
+# a genuine technique/drill-only session. Swimming only: its frequency-over-
+# duration rationale (see SPORT_PROPERTIES.frequency_priority) doesn't
+# transfer to running or cycling, where a sub-20-minute session isn't a
+# meaningful stimulus relative to its logistical cost.
+ABSOLUTE_MIN_SESSION_MINUTES = 15
 
 STRENGTH_SESSION_MINUTES = 30
 MAX_STRENGTH_SESSIONS = 2
+
+# A single day carrying 3+ sessions of the same sport is not something to
+# build general support for — this is a hard ceiling even for a locked
+# count, independent of max_sessions_per_day.
+MAX_SAME_SPORT_SESSIONS_PER_DAY = 2
 
 
 def _round_duration(minutes: float) -> int:
@@ -1055,7 +1120,8 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
                           max_sessions_per_day: int = 1,
                           limits: dict | None = None,
                           requested: dict[str, int] | None = None,
-                          quality_priority: list[str] | None = None) -> list[dict]:
+                          quality_priority: list[str] | None = None,
+                          allow_quality_stacking: bool = False) -> list[dict]:
     """Place every session of the week on a day.
 
     Returns a flat list of {day, sport} slots — more than one per day once the
@@ -1071,6 +1137,23 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
     even over a sport with more total sessions remaining that week. Pass
     `None` (or omit a sport from the list) to fall back to the plain
     session-count heuristic for that sport.
+
+    `allow_quality_stacking` lets the top-ranked sport claim MORE THAN ONE
+    quality day in the same week, instead of the default round-robin where
+    every sport that wins a quality day sits out the rest. Only ever true
+    when the athlete stated an explicit `quality_sport_priority` — never a
+    default, since it silently changes who gets which hard day. Even when
+    allowed, a second quality day for the same sport still needs
+    MIN_DAYS_BETWEEN_SAME_SPORT_QUALITY of separation and stays off that
+    sport's own long_day (and the day either side of it).
+
+    A sport the athlete locked to an exact weekly count (`sport_limits
+    [sport].lock_sessions`) is also allowed to double up on the SAME day
+    with itself once every other day is full — capped at
+    MAX_SAME_SPORT_SESSIONS_PER_DAY — so an extreme locked count (more
+    sessions than there are training days) gets honored by adding sessions
+    to a day rather than by this function silently running out of days and
+    under-delivering the count.
     """
     real_sports = [s for s in sports if s != "strength"]
     if not real_sports:
@@ -1082,8 +1165,17 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
 
     remaining = _allocate_sport_sessions(real_sports, total_sessions,
                                          primary_sport, limits, requested)
+    locked_sports = {
+        s for s in real_sports if (limits or {}).get(s, {}).get("lock_sessions")
+    }
     slots: list[dict] = []
     day_sports: dict[str, set[str]] = {}
+    # Total sessions placed on a day, as distinct from `day_sports` (the SET
+    # of sports on that day) — the two only diverge once a locked sport
+    # doubles up with itself, which is exactly the case max_sessions_per_day
+    # capacity checks below need to count correctly.
+    day_count: dict[str, int] = {}
+    day_sport_count: dict[str, dict[str, int]] = {}
 
     def allowed(sport: str, day: str) -> bool:
         """A discipline the athlete can only do on certain days — pool hours,
@@ -1097,6 +1189,9 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
     def place(sport: str, day: str) -> None:
         slots.append({"day": day, "sport": sport})
         day_sports.setdefault(day, set()).add(sport)
+        day_count[day] = day_count.get(day, 0) + 1
+        sport_counts = day_sport_count.setdefault(day, {})
+        sport_counts[sport] = sport_counts.get(sport, 0) + 1
         remaining[sport] -= 1
 
     # 1. Explicit long-session days (sport_limits[sport].long_day) claim their
@@ -1112,8 +1207,7 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
             continue
         if not allowed(sport, day):
             continue  # a day restriction (pool hours etc.) still wins
-        occupants = day_sports.get(day, set())
-        if remaining.get(sport, 0) > 0 and len(occupants) < max_sessions_per_day:
+        if remaining.get(sport, 0) > 0 and day_count.get(day, 0) < max_sessions_per_day:
             place(sport, day)
             pinned_long_days[sport] = day
 
@@ -1125,17 +1219,38 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
         s: len(quality_priority) - i for i, s in enumerate(quality_priority or [])
     }
     quality_used: set[str] = set()
+    quality_day_index: dict[str, int] = {}
     for day in quality_days:
-        if len(day_sports.get(day, set())) >= max_sessions_per_day:
+        if day_count.get(day, 0) >= max_sessions_per_day:
             continue
         available = usable(day)
         if not available:
             continue
-        fresh = [s for s in available if s not in quality_used] or available
+        day_idx = DAY_ORDER.index(day)
+
+        if allow_quality_stacking:
+            def blocked(s: str) -> bool:
+                # No restriction on a sport's FIRST quality day of the week —
+                # only a second (or later) one needs spacing from the first.
+                last = quality_day_index.get(s)
+                if last is None:
+                    return False
+                if abs(day_idx - last) < MIN_DAYS_BETWEEN_SAME_SPORT_QUALITY:
+                    return True
+                own_long_day = (limits or {}).get(s, {}).get("long_day")
+                if own_long_day and own_long_day in training_days:
+                    if abs(day_idx - DAY_ORDER.index(own_long_day)) <= 1:
+                        return True
+                return False
+            fresh = [s for s in available if not blocked(s)] or available
+        else:
+            fresh = [s for s in available if s not in quality_used] or available
+
         pick = max(fresh, key=lambda s: (
             priority_rank.get(s, -1), remaining[s], s == primary_sport,
         ))
         quality_used.add(pick)
+        quality_day_index[pick] = day_idx
         place(pick, day)
 
         # An athlete with same-day access (e.g. a pool at the gym they cycle
@@ -1145,7 +1260,7 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
         pair_sport = (limits or {}).get(pick, {}).get("quality_pm_pair")
         if (pair_sport and pair_sport != pick and max_sessions_per_day > 1
                 and remaining.get(pair_sport, 0) > 0 and allowed(pair_sport, day)
-                and len(day_sports.get(day, set())) < max_sessions_per_day):
+                and day_count.get(day, 0) < max_sessions_per_day):
             place(pair_sport, day)
 
     # 3. Weekends carry the long sessions.
@@ -1177,27 +1292,42 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
         place(max(spaced, key=lambda s: remaining[s]), day)
 
     # 5. Anything still owed becomes a second session. These go on the days
-    #    carrying the least so far, and never double up the same discipline.
+    #    carrying the least so far, and never double up the same discipline —
+    #    except a sport the athlete locked to an exact count, once every day
+    #    has at least one different sport on it (capped at
+    #    MAX_SAME_SPORT_SESSIONS_PER_DAY). Without this a locked count above
+    #    what one-per-day scheduling can hold gets silently under-delivered
+    #    instead of honored; the athlete-facing shortfall report still flags
+    #    it if even doubling can't close the gap.
     if max_sessions_per_day > 1:
         guard = 0
         while any(n > 0 for n in remaining.values()) and guard < 50:
             guard += 1
             candidates = [
                 d for d in training_days
-                if len(day_sports.get(d, set())) < max_sessions_per_day
+                if day_count.get(d, 0) < max_sessions_per_day
                 and d not in quality_days
             ] or [
                 d for d in training_days
-                if len(day_sports.get(d, set())) < max_sessions_per_day
+                if day_count.get(d, 0) < max_sessions_per_day
             ]
             if not candidates:
                 break
-            day = min(candidates, key=lambda d: len(day_sports.get(d, set())))
+            day = min(candidates, key=lambda d: day_count.get(d, 0))
             available = [s for s in usable(day)
                          if s not in day_sports.get(day, set())]
             if not available:
+                doubled = [
+                    s for s in usable(day)
+                    if s in locked_sports
+                    and day_sport_count.get(day, {}).get(s, 0) < MAX_SAME_SPORT_SESSIONS_PER_DAY
+                ]
+                if doubled:
+                    place(max(doubled, key=lambda s: remaining[s]), day)
+                    continue
                 # Nothing new can go on the emptiest day; retire it and retry.
                 day_sports.setdefault(day, set()).update(real_sports)
+                day_count[day] = max_sessions_per_day
                 continue
             place(max(available, key=lambda s: remaining[s]), day)
 
@@ -1290,13 +1420,21 @@ def _slot_cap(slot: dict, week_type: str = "build") -> int:
     return cap
 
 
-def _slot_floor(slot: dict, week_type: str = "build") -> int:
+def _slot_floor(slot: dict, week_type: str = "build", locked: bool = False) -> int:
     """Smallest duration at which this session is still worth doing.
 
     Recovery weeks accept shorter sessions: keeping frequency matters more
     than session length when volume is deliberately cut. A long session
     claims a higher floor so that a week which cannot afford both frequency
     and a real long session gives up a frequency day rather than the long one.
+
+    `locked` (this slot's sport was locked to an exact weekly count) drops
+    swimming's floor further still, to ABSOLUTE_MIN_SESSION_MINUTES — a
+    genuine technique/drill-only session — as a last resort so an extreme
+    locked count is honored by shrinking sessions rather than dropping them.
+    Not extended to running or cycling: a sub-20-minute run or ride isn't a
+    meaningful stimulus relative to its logistical cost the way a short
+    technique swim still is.
     """
     props = SPORT_PROPERTIES.get(slot["sport"], {})
     base = MIN_SESSION_DURATION if week_type in ("recovery", "taper") else MIN_ENDURANCE_DURATION
@@ -1304,7 +1442,7 @@ def _slot_floor(slot: dict, week_type: str = "build") -> int:
     if props.get("frequency_priority"):
         # A short technique swim is worth doing; holding swimming to the same
         # floor as a run is what makes it the first thing cut from a thin week.
-        base = MIN_SESSION_DURATION
+        base = ABSOLUTE_MIN_SESSION_MINUTES if locked and slot["sport"] == "swimming" else MIN_SESSION_DURATION
     else:
         # Otherwise scale the floor to what a session of that sport normally
         # looks like. An hour on the bike is a short ride; an hour running is
@@ -1318,7 +1456,9 @@ def _slot_floor(slot: dict, week_type: str = "build") -> int:
 
 
 def _allocate_slot_durations(slots: list[dict], total_minutes: float,
-                             week_type: str) -> tuple[list[dict], int]:
+                             week_type: str,
+                             locked_sports: set[str] | None = None,
+                             ) -> tuple[list[dict], int]:
     """Size each session. Returns (surviving slots, minutes that would not fit).
 
     Quality sessions are sized first: they are bounded by what an athlete can
@@ -1327,7 +1467,15 @@ def _allocate_slot_durations(slots: list[dict], total_minutes: float,
     worth doing, and only the surplus above those floors is distributed
     proportionally — overflow past a session's cap goes into the long sessions
     before it is given up on.
+
+    `locked_sports` (sport_limits[sport].lock_sessions) are dropped last, not
+    first: this pass runs "whichever discipline currently has the most gets
+    trimmed", and a sport the athlete explicitly locked to a high count is
+    almost by definition the one with the most sessions that week — without
+    this exemption a lock gets silently undercut a second time, downstream of
+    _build_sport_schedule already trying to honor it.
     """
+    locked_sports = locked_sports or set()
     quality = [s for s in slots if s["archetype"] == "quality"]
     endurance = [s for s in slots if s["archetype"] != "quality"]
 
@@ -1347,15 +1495,18 @@ def _allocate_slot_durations(slots: list[dict], total_minutes: float,
 
     active = list(endurance)
 
+    def floor_for(slot: dict) -> int:
+        return _slot_floor(slot, week_type, locked=slot["sport"] in locked_sports)
+
     def floors() -> int:
-        return sum(_slot_floor(s, week_type) for s in active)
+        return sum(floor_for(s) for s in active)
 
     # A long session reserves 1.5x the normal floor. On a thin week two of them
     # can claim the entire budget, so give up the long designation before
     # giving up sessions — more appropriately sized sessions beat fewer
     # oversized ones.
     longs = sorted((s for s in active if s["archetype"] == "long"),
-                   key=lambda s: -_slot_floor(s, week_type))
+                   key=lambda s: -floor_for(s))
     for slot in longs:
         if floors() <= pool:
             break
@@ -1363,9 +1514,15 @@ def _allocate_slot_durations(slots: list[dict], total_minutes: float,
 
     # Whatever still does not fit gets dropped, easy sessions first and taken
     # from whichever discipline currently has the most — otherwise a thin week
-    # deletes a whole sport while another keeps three sessions.
+    # deletes a whole sport while another keeps three sessions. A locked
+    # sport's sessions are only dropped once nothing unlocked is left to drop
+    # (see docstring).
     while active and floors() > pool:
-        droppable = [s for s in active if s["archetype"] == "easy"] or active
+        unlocked_easy = [s for s in active
+                         if s["archetype"] == "easy" and s["sport"] not in locked_sports]
+        droppable = (unlocked_easy
+                     or [s for s in active if s["archetype"] == "easy"]
+                     or active)
         per_sport: dict[str, int] = {}
         for slot in active:
             per_sport[slot["sport"]] = per_sport.get(slot["sport"], 0) + 1
@@ -1376,7 +1533,7 @@ def _allocate_slot_durations(slots: list[dict], total_minutes: float,
         return quality, max(0, round(pool))
 
     for slot in active:
-        slot["duration"] = float(_slot_floor(slot, week_type))
+        slot["duration"] = float(floor_for(slot))
         props = SPORT_PROPERTIES.get(slot["sport"], {})
         slot["_weight"] = (
             props.get("typical_endurance_minutes", 60)
@@ -2181,6 +2338,17 @@ def build_plan(profile: dict, ftp: int,
     else:
         quality_priority = [primary_sport] if primary_sport in real_sports else []
 
+    # Letting the top-ranked sport claim more than one quality day a week
+    # (instead of one-quality-day-per-sport round robin) is only ever
+    # allowed when the athlete explicitly stated the ranking — silently
+    # changing who gets which hard day for the implicit primary-sport-only
+    # default would be a different, unrequested behavior change. See
+    # MAX_CONSECUTIVE_WEEKS_SINGLE_SPORT_ALL_QUALITY below for the bound
+    # that stops this becoming a permanent zero-intensity sentence for the
+    # lower-ranked sports.
+    allow_quality_stacking = bool(stated_priority)
+    weeks_single_sport_quality_streak = 0
+
     # How many consecutive non-recovery/taper weeks swimming has gone without
     # a quality slot — forces one back in past MAX_CONSECUTIVE_WEEKS_ZERO_
     # QUALITY_SWIM or inside PRE_RACE_SWIM_QUALITY_FLOOR_WEEKS of the event,
@@ -2314,16 +2482,27 @@ def build_plan(profile: dict, ftp: int,
                     ["swimming"] + [s for s in quality_priority if s != "swimming"]
                 )
 
+        # Stacking is paused for one week once the top sport has claimed
+        # every quality day for MAX_CONSECUTIVE_WEEKS_SINGLE_SPORT_ALL_
+        # QUALITY weeks running — the streak below tracks that and this is
+        # the only thing that reads it.
+        week_allow_stacking = (
+            allow_quality_stacking
+            and weeks_single_sport_quality_streak < MAX_CONSECUTIVE_WEEKS_SINGLE_SPORT_ALL_QUALITY
+        )
+
         sport_schedule = _build_sport_schedule(
             sports, week_quality_days, week_easy_days, primary_sport,
             session_target, max_sessions_per_day, sport_limits, week_requested,
-            week_quality_priority,
+            week_quality_priority, week_allow_stacking,
         )
         base_slots = _assign_archetypes(
             sport_schedule, week_quality_days, capacity["long_session_essential"],
             sport_limits,
         )
-        slots, unfitted = _allocate_slot_durations(base_slots, week_minutes, week_type)
+        slots, unfitted = _allocate_slot_durations(
+            base_slots, week_minutes, week_type, locked_sports,
+        )
 
         if "swimming" in real_sports and week_type not in ("recovery", "taper"):
             if any(s["sport"] == "swimming" and s["archetype"] == "quality"
@@ -2331,6 +2510,14 @@ def build_plan(profile: dict, ftp: int,
                 weeks_since_quality_swim = 0
             else:
                 weeks_since_quality_swim += 1
+
+        quality_sports_this_week = {
+            s["sport"] for s in base_slots if s["archetype"] == "quality"
+        }
+        if len(week_quality_days) > 1 and len(quality_sports_this_week) == 1:
+            weeks_single_sport_quality_streak += 1
+        else:
+            weeks_single_sport_quality_streak = 0
 
         quality_types = _pick_quality_types(week_quality, week_num)
         for idx, slot in enumerate(s for s in slots if s["archetype"] == "quality"):
@@ -2343,7 +2530,7 @@ def build_plan(profile: dict, ftp: int,
             long_slot = next((s for s in slots if s["archetype"] == "long"), None)
             slots.extend(_apply_norwegian_double_threshold(
                 slots, real_sports, long_slot["day"] if long_slot else None,
-                max_sessions_per_day, sport_limits, week_requested,
+                max_sessions_per_day, sport_limits, week_requested, experience,
             ))
 
         strength_days = _pick_strength_days(slots) if "strength" in sports else set()

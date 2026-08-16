@@ -11,6 +11,7 @@ import pytest
 from app.services.plan_builder import (
     DAY_ORDER,
     _allocate_sport_sessions,
+    _build_sport_schedule,
     compute_session_target,
     SPORT_PROPERTIES,
     build_plan,
@@ -27,6 +28,9 @@ from app.services.plan_builder import (
     norwegian_method_eligible,
     NORWEGIAN_DOUBLE_THRESHOLD_DAYS_PER_WEEK,
     MIN_DAYS_BETWEEN_DOUBLE_THRESHOLD,
+    MIN_DAYS_BETWEEN_SAME_SPORT_QUALITY,
+    MAX_CONSECUTIVE_WEEKS_SINGLE_SPORT_ALL_QUALITY,
+    MAX_SAME_SPORT_SESSIONS_PER_DAY,
     _session_frequency_report,
 )
 
@@ -1062,6 +1066,170 @@ def test_a_locked_recovery_week_still_scales_down():
         assert len(sessions_by_day(week, "swimming")) < 6, week["week_number"]
 
 
+def test_an_outlandish_locked_count_is_honored_via_same_day_doubling():
+    """10 locked swims/week does not fit one-per-day in a 7-day week — the
+    planner should double up on some days (never more than
+    MAX_SAME_SPORT_SESSIONS_PER_DAY) rather than silently under-delivering
+    the count the athlete explicitly locked in."""
+    profile = make_profile(weekly_hours=14, max_sessions_per_day=2,
+                           plan_duration_weeks=4,
+                           sport_limits={"swimming": {"sessions": 10, "lock_sessions": True}})
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    build_weeks = [w for w in plan["weeks"] if w["week_type"] == "build"]
+    assert build_weeks
+    for week in build_weeks:
+        days = sessions_by_day(week, "swimming")
+        assert len(days) == 10, (week["week_number"], days)
+        per_day: dict[str, int] = {}
+        for d in days:
+            per_day[d] = per_day.get(d, 0) + 1
+        assert max(per_day.values()) <= MAX_SAME_SPORT_SESSIONS_PER_DAY, per_day
+
+
+def test_an_unlocked_extreme_count_still_reports_a_real_shortfall():
+    """Without lock_sessions, the same ask should not trigger same-day
+    doubling — the shortfall shows up honestly instead."""
+    profile = make_profile(weekly_hours=14, max_sessions_per_day=2,
+                           plan_duration_weeks=4,
+                           sport_limits={"swimming": {"sessions": 10}})
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    assert "session_targets" in plan
+    assert plan["session_targets"].get("unmet", {}).get("swimming")
+
+
+def test_locked_sport_is_not_the_first_dropped_when_the_week_is_tight():
+    """A sport locked to a high count is, almost by definition, the one with
+    the most sessions that week — the drop-when-tight pass must not treat
+    that as a reason to trim it first."""
+    profile = make_profile(weekly_hours=6, max_sessions_per_day=2,
+                           sports=["cycling", "running", "swimming"],
+                           plan_duration_weeks=2,
+                           sport_limits={"swimming": {"sessions": 5, "lock_sessions": True}})
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    for week in plan["weeks"]:
+        if week["week_type"] != "build":
+            continue
+        assert len(sessions_by_day(week, "swimming")) >= 4, week["week_number"]
+
+
+# --- Quality-day stacking (quality_sport_priority) ---
+
+def quality_days_by_sport(week: dict) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+    for day in week["days"]:
+        for w in day["workouts"]:
+            if w.get("archetype") == "quality":
+                result.setdefault(w["sport"], []).append(day["day"])
+    return result
+
+
+def test_without_a_stated_priority_quality_days_still_round_robin():
+    """The implicit primary-sport-only default must not silently start
+    stacking — that would be an unrequested behavior change."""
+    profile = make_profile(
+        weekly_hours=16, sports=["cycling", "running", "swimming"],
+        max_sessions_per_day=2, preferred_hard_days=["tuesday", "thursday"],
+        primary_sport="cycling",
+    )
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    for week in plan["weeks"]:
+        by_sport = quality_days_by_sport(week)
+        for sport, days in by_sport.items():
+            assert len(days) <= 1, (week["week_number"], sport, days)
+
+
+def test_a_stated_priority_lets_the_top_sport_stack_quality_days():
+    profile = make_profile(
+        weekly_hours=16, sports=["cycling", "running", "swimming"],
+        max_sessions_per_day=2, preferred_hard_days=["tuesday", "thursday"],
+        quality_sport_priority=["cycling", "running", "swimming"],
+    )
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    stacked_any = False
+    for week in plan["weeks"]:
+        if week["week_type"] != "build":
+            continue
+        by_sport = quality_days_by_sport(week)
+        cycling_days = by_sport.get("cycling", [])
+        if len(cycling_days) > 1:
+            stacked_any = True
+            idx = sorted(DAY_ORDER.index(d) for d in cycling_days)
+            for a, b in zip(idx, idx[1:]):
+                assert b - a >= MIN_DAYS_BETWEEN_SAME_SPORT_QUALITY, week["week_number"]
+    assert stacked_any, "expected cycling to claim 2 quality days in at least one week"
+
+
+def test_quality_stacking_respects_the_minimum_day_spacing():
+    """Direct unit test of the placement function: with enough alternative
+    sessions to go around, cycling's second quality day must be at least
+    MIN_DAYS_BETWEEN_SAME_SPORT_QUALITY away from its first."""
+    schedule = _build_sport_schedule(
+        sports=["cycling", "running", "swimming"],
+        quality_days=["tuesday", "thursday", "friday"],
+        easy_days=["monday", "wednesday", "saturday", "sunday"],
+        primary_sport="cycling",
+        total_sessions=9,
+        max_sessions_per_day=1,
+        limits={"cycling": {"long_day": "saturday"}},
+        quality_priority=["cycling", "running", "swimming"],
+        allow_quality_stacking=True,
+    )
+    cycling_days = sorted(
+        DAY_ORDER.index(s["day"]) for s in schedule
+        if s["sport"] == "cycling" and s["day"] in ("tuesday", "thursday", "friday")
+    )
+    for a, b in zip(cycling_days, cycling_days[1:]):
+        assert b - a >= MIN_DAYS_BETWEEN_SAME_SPORT_QUALITY
+    assert len(cycling_days) >= 2, "expected cycling to stack at least 2 quality days here"
+
+
+def test_quality_stacking_avoids_the_stacked_sports_own_long_day():
+    """A day satisfying the spacing rule can still be excluded because it's
+    adjacent to the stacking sport's own long_day — tested in isolation from
+    spacing by giving the two candidate quality days plenty of separation."""
+    schedule = _build_sport_schedule(
+        sports=["cycling", "running", "swimming"],
+        quality_days=["sunday", "tuesday"],  # processed in this order
+        easy_days=["monday", "wednesday", "thursday", "friday", "saturday"],
+        primary_sport="cycling",
+        total_sessions=9,
+        max_sessions_per_day=1,
+        limits={"cycling": {"long_day": "wednesday"}},  # excludes tuesday/thursday
+        quality_priority=["cycling", "running", "swimming"],
+        allow_quality_stacking=True,
+    )
+    cycling_quality_days = {
+        s["day"] for s in schedule
+        if s["sport"] == "cycling" and s["day"] in ("sunday", "tuesday")
+    }
+    if "sunday" in cycling_quality_days:
+        assert "tuesday" not in cycling_quality_days, \
+            "tuesday is adjacent to cycling's own wednesday long_day"
+
+
+def test_stacking_pauses_after_max_consecutive_weeks():
+    profile = make_profile(
+        weekly_hours=16, sports=["cycling", "running", "swimming"],
+        max_sessions_per_day=2, preferred_hard_days=["tuesday", "thursday"],
+        quality_sport_priority=["cycling", "running", "swimming"],
+        plan_duration_weeks=12,
+    )
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    streak = 0
+    max_streak = 0
+    for week in plan["weeks"]:
+        by_sport = quality_days_by_sport(week)
+        sports_with_quality = {s for s, d in by_sport.items() if d}
+        if len(week["days"]) and len(sports_with_quality) == 1 and any(
+            len(d) > 1 for d in by_sport.values()
+        ):
+            streak += 1
+        else:
+            streak = 0
+        max_streak = max(max_streak, streak)
+    assert max_streak <= MAX_CONSECUTIVE_WEEKS_SINGLE_SPORT_ALL_QUALITY
+
+
 # --- Norwegian method ---
 
 def test_norwegian_eligibility_requires_hours_week_type_and_ramp_stability():
@@ -1079,6 +1247,48 @@ def test_norwegian_eligibility_requires_hours_week_type_and_ramp_stability():
         "should not stack on an active ramp"
     assert norwegian_method_eligible(profile, 0.96, 1.0, "build"), \
         "within 0.95x peak counts as stable"
+
+
+def test_norwegian_beginner_gets_one_double_day_intermediate_gets_two():
+    """A beginner opting in isn't blocked (the hours floor already gates
+    that) but gets one double-threshold day instead of two, since pacing
+    discipline — not fitness — is the actual risk for a beginner."""
+    def double_day_counts(experience: str) -> list[int]:
+        profile = make_profile(
+            weekly_hours=16, sports=["cycling", "running", "swimming"],
+            max_sessions_per_day=2, training_style="norwegian",
+            plan_duration_weeks=6, experience_level=experience,
+        )
+        plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+        return [
+            len({d["day"] for d in week["days"]
+                 for w in d["workouts"] if w.get("workout_type") == "sub_threshold"})
+            for week in plan["weeks"]
+        ]
+
+    beginner_counts = double_day_counts("beginner")
+    intermediate_counts = double_day_counts("intermediate")
+    assert max(beginner_counts) <= 1
+    assert max(intermediate_counts) <= NORWEGIAN_DOUBLE_THRESHOLD_DAYS_PER_WEEK
+    assert max(intermediate_counts) > max(beginner_counts), \
+        "intermediate should reach 2 double-threshold days in at least one week"
+
+
+def test_norwegian_double_threshold_day_never_adjacent_to_the_long_session():
+    profile = make_profile(
+        weekly_hours=18, sports=["cycling", "running", "swimming"],
+        max_sessions_per_day=2, training_style="norwegian",
+        plan_duration_weeks=6, sport_limits={"cycling": {"long_day": "saturday"}},
+    )
+    plan = build_plan(profile, ftp=250, start_date="2026-08-10")
+    for week in plan["weeks"]:
+        double_days = {
+            d["day"] for d in week["days"]
+            for w in d["workouts"] if w.get("workout_type") == "sub_threshold"
+        }
+        assert "friday" not in double_days, week["week_number"]
+        assert "saturday" not in double_days, week["week_number"]
+        assert "sunday" not in double_days, week["week_number"]
 
 
 def test_norwegian_double_threshold_placement_is_bounded_and_spaced():

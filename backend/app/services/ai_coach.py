@@ -105,12 +105,18 @@ Write professional plans with detailed workout descriptions similar to TrainingP
 Rules:
 - Respect the total hours budget
 - Place hard sessions when TSB allows (not when heavily fatigued)
-- Don't stack two hard sessions on consecutive days unless fitness supports it
+- Quality/hard sessions for the SAME discipline need at least one full easy day
+  between them — never back-to-back. Two DIFFERENT disciplines may each carry a
+  quality session on consecutive calendar days if the envelope places them that way.
 - Include at least 1 rest day per week
 - Each workout gets a detailed description explaining purpose, feel, and execution cues
 - Periodize within the week: hard/easy pattern, build toward key sessions
-- Swapping two workouts on the same day has no consequence
-- If a workout is skipped, reduce remaining week load proportionally
+- Reordering which session happens first on a day with two workouts (AM/PM order)
+  has no training consequence. Do not move a workout to a different day.
+- If a workout is skipped, reduce remaining week load proportionally, capped at
+  most 15% of the week's remaining planned minutes. A skipped easy/recovery
+  session should not change the rest of the week at all — only a skipped
+  quality or long session warrants redistributing load.
 
 Output a JSON object:
 {
@@ -194,11 +200,18 @@ As race distance increases:
 - Ironman: large aerobic volume cannot be replaced with intervals
 
 ### Session Archetypes
-Each discipline should generally contain at most one session of each archetype per week:
+Each discipline should normally contain at most one session of each archetype per week:
 - one long session
 - zero or one quality session
 - one or more easy sessions
 - optional recovery session
+
+Exception: when the athlete has explicitly ranked disciplines via
+`quality_sport_priority`, the top-ranked discipline may carry TWO quality-tagged
+sessions in the same week (spaced at least a couple of days apart in the
+envelope). If the envelope hands you a second quality slot for one discipline,
+that is a deliberate athlete choice — write it as a real quality session, don't
+"correct" it back to easy.
 
 Every session in the envelope is tagged with its archetype. Respect those tags.
 When multiple designs satisfy the required weekly volume, prefer the one that:
@@ -215,7 +228,10 @@ When multiple designs satisfy the required weekly volume, prefer the one that:
 - Never prescribe excessive intensity for the available volume
 - Never increase running load too rapidly
 - Never omit recovery weeks
-- Never schedule unnecessary consecutive hard days
+- Never schedule two quality/hard sessions for the SAME discipline on
+  back-to-back days — that discipline needs a full easy day between them.
+  Two different disciplines each having a hard day on consecutive calendar
+  days is fine and expected.
 - Never overemphasize one discipline without event-specific justification"""
 
 

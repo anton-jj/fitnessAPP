@@ -887,11 +887,17 @@ function StepEquipment({ profile, update }: any) {
 }
 
 /** Backend hard-enforces weekly_hours >= 12 and ramp-stability at generation
- *  time regardless of this toggle — the gate here is just steering the
- *  athlete before they hit a no-op, not the actual guard. */
+ *  time regardless of this toggle — that's the real gate, so it's the only
+ *  thing that blocks the toggle here too. Experience level isn't a hard
+ *  block: what a beginner actually lacks is pacing discipline (holding a
+ *  controlled 90-95% FTP effort without drifting into a true threshold/VO2max
+ *  effort), not fitness — the backend already handles that by capping a
+ *  beginner at one double-threshold day/week instead of two, so this is a
+ *  warning, not a refusal. */
 function TrainingStyleToggle({ profile, update }: any) {
-  const eligible = profile.weekly_hours >= 12 && profile.experience_level === 'advanced'
+  const eligible = profile.weekly_hours >= 12
   const active = profile.training_style === 'norwegian'
+  const isBeginner = profile.experience_level === 'beginner'
 
   return (
     <div>
@@ -919,8 +925,15 @@ function TrainingStyleToggle({ profile, update }: any) {
       </button>
       {!eligible && (
         <p className="text-[11px] text-warning mt-2">
-          Needs 12+ weekly hours and Advanced experience — currently{' '}
-          {profile.weekly_hours}h and {profile.experience_level || 'not set'}.
+          Needs 12+ weekly hours — currently {profile.weekly_hours}h.
+        </p>
+      )}
+      {eligible && active && isBeginner && (
+        <p className="text-[11px] text-warning mt-2">
+          Double-threshold training depends on precise, conservative effort control —
+          going out too hard turns a controlled session into just another hard day. As
+          a beginner you'll get one double-threshold day a week instead of two, to
+          start.
         </p>
       )}
     </div>
