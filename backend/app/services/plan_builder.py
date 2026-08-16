@@ -543,29 +543,58 @@ def norwegian_method_eligible(profile: dict, week_multiplier: float,
 
 
 def _norwegian_shakeout_sport(sports: list[str], am_sport: str) -> str | None:
-    """Lowest-stress discipline available for the PM shakeout.
+    """Preferred discipline for the PM shakeout.
 
-    Running must never get doubled same-day, so if the AM double-threshold
-    session is a run, the PM shakeout has to be a different, cheaper sport.
+    The actual double in double-threshold is a hard AM dose and an easy PM
+    dose of the SAME discipline — not a different sport bolted on. That's
+    preferred whenever the AM sport is safe to double (i.e. not running).
+    When it isn't — running must never get doubled same-day — cycling is the
+    fallback: no pool or facility to get to, minimal orthopedic cost, easy to
+    fit in on top of an AM interval session. Raw `stress_factor` alone would
+    pick swimming instead (0.2 vs. cycling's 0.4) — physiologically cheaper,
+    but a same-day second session needs to actually be convenient, and
+    swimming's logistics (pool access, travel, timing) make it a poor fit for
+    that even though it scores lower on paper.
     """
-    candidates = [s for s in sports if s != "strength" and s != am_sport]
+    real = [s for s in sports if s != "strength"]
+    if am_sport != "running" and am_sport in real:
+        return am_sport
+    candidates = [s for s in real if s != am_sport]
     if not candidates:
         return None
-    return min(candidates, key=lambda s: SPORT_PROPERTIES.get(s, {}).get("stress_factor", 1.0))
+    if "cycling" in candidates:
+        return "cycling"
+    non_running = [s for s in candidates if s != "running"]
+    return min(non_running or candidates,
+              key=lambda s: SPORT_PROPERTIES.get(s, {}).get("stress_factor", 1.0))
 
 
 def _apply_norwegian_double_threshold(slots: list[dict], sports: list[str],
                                       long_day: str | None,
                                       max_sessions_per_day: int,
-                                      limits: dict | None = None) -> list[dict]:
+                                      limits: dict | None = None,
+                                      week_requested: dict[str, int] | None = None
+                                      ) -> list[dict]:
     """Restructure up to NORWEGIAN_DOUBLE_THRESHOLD_DAYS_PER_WEEK quality days
     into AM sub-threshold / PM shakeout pairs, and return the new PM slots.
 
     This does not raise compute_quality_sessions' ceiling — it reshapes
     existing quality slots (tagging them "sub_threshold" in place) rather
-    than adding new ones. The PM shakeouts are genuinely net-new sessions, so
-    each is checked against the destination sport's weekly ceiling and the
-    day's max_sessions_per_day before being added.
+    than adding new ones. The PM shakeout itself is checked against two
+    different limits depending on whose day it's landing on:
+
+    - Same sport as the AM session (the common case — see
+      `_norwegian_shakeout_sport`): this PM session is the second half of a
+      quality slot that sport's own count already includes, so it is allowed
+      PAST the athlete's requested/locked session count for that sport —
+      blocking it would just delete the quality work that slot used to
+      provide instead of adding to it. Only a stated hard `max_sessions`
+      (a real resource limit like pool hours) or the sport's structural
+      safety ceiling still stop it.
+    - A different sport (running's AM can never double, so its PM always
+      lands elsewhere): this is genuinely new volume for that sport, so a
+      `lock_sessions` sport is left at its requested count rather than
+      quietly exceeded.
     """
     quality_slots = sorted(
         (s for s in slots if s["archetype"] == "quality"),
@@ -601,12 +630,24 @@ def _apply_norwegian_double_threshold(slots: list[dict], sports: list[str],
     for slot in chosen:
         if day_counts.get(slot["day"], 0) >= max_sessions_per_day:
             continue
-        pm_sport = _norwegian_shakeout_sport(sports, slot["sport"])
+        am_sport = slot["sport"]
+        pm_sport = _norwegian_shakeout_sport(sports, am_sport)
         if not pm_sport:
             continue
-        ceiling = _sport_ceiling(pm_sport, limits)
-        if sport_counts.get(pm_sport, 0) >= ceiling:
+
+        entry = (limits or {}).get(pm_sport) or {}
+        if pm_sport == am_sport:
+            cap = entry.get("max_sessions") or SPORT_PROPERTIES.get(
+                pm_sport, {}).get("max_weekly_sessions", 7)
+        else:
+            requested_n = (week_requested or {}).get(pm_sport)
+            if entry.get("lock_sessions") and requested_n:
+                cap = requested_n
+            else:
+                cap = _sport_ceiling(pm_sport, limits)
+        if sport_counts.get(pm_sport, 0) >= cap:
             continue
+
         max_pm = SPORT_PROPERTIES.get(pm_sport, {}).get("max_session_minutes", 60)
         duration = min(max_pm, _round_duration(sum(PM_SHAKEOUT_MINUTES) / 2))
         extra.append({
@@ -2215,7 +2256,7 @@ def build_plan(profile: dict, ftp: int,
             long_slot = next((s for s in slots if s["archetype"] == "long"), None)
             slots.extend(_apply_norwegian_double_threshold(
                 slots, real_sports, long_slot["day"] if long_slot else None,
-                max_sessions_per_day, sport_limits,
+                max_sessions_per_day, sport_limits, week_requested,
             ))
 
         strength_days = _pick_strength_days(slots) if "strength" in sports else set()
