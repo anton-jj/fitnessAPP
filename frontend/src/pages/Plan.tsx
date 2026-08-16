@@ -57,6 +57,84 @@ function formatPace(secondsPer: number, sport: string): string {
   return `${mins}:${secs}${sport === 'swimming' ? '/100m' : '/km'}`
 }
 
+type PlanNote = { id: string; text: string; hint?: string }
+
+// Several independent bits of the generator (progression assessment, capacity
+// mismatch, session-count shortfall, safety validation) can each produce a
+// warning for the same plan. Shown as separate boxes that reads as alarming
+// even when most of it is routine — fold them into one panel instead, and
+// keep it collapsed past a couple of items so a plan with several minor notes
+// doesn't read as more broken than it is.
+function buildPlanNotes(planData: any): PlanNote[] {
+  const notes: PlanNote[] = []
+  if (planData?.progression_assessment?.note) {
+    notes.push({ id: 'progression', text: planData.progression_assessment.note })
+  }
+  if (planData?.capacity_feedback) {
+    notes.push({ id: 'capacity', text: planData.capacity_feedback })
+  }
+  const targets = planData?.session_targets
+  // shortfall_expected === true means the gap is fully explained by
+  // recovery/taper/ramp scaling — nothing for the athlete to act on, so it's
+  // suppressed entirely rather than just downgraded.
+  if (targets?.note && targets.shortfall_expected !== true) {
+    notes.push({
+      id: 'session-targets',
+      text: `Could not fit every session you asked for — ${targets.note}.`,
+      hint: 'Add hours, allow more sessions per day, or free up a rest day.',
+    })
+  }
+  if (Array.isArray(planData?.safety_warnings)) {
+    planData.safety_warnings.forEach((w: string, i: number) => {
+      notes.push({ id: `safety-${i}`, text: w })
+    })
+  }
+  return notes
+}
+
+function PlanNotes({ notes }: { notes: PlanNote[] }) {
+  const [expanded, setExpanded] = useState(false)
+  if (notes.length === 0) return null
+
+  const VISIBLE = 2
+  const shown = expanded ? notes : notes.slice(0, VISIBLE)
+  const hiddenCount = notes.length - shown.length
+
+  return (
+    <div className="bg-warning/10 border border-warning/20 rounded-xl p-3 text-sm text-warning space-y-2">
+      <div className="flex items-center gap-2">
+        <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+        <span className="font-medium">Plan notes</span>
+        <span className="text-xs text-warning/70">({notes.length})</span>
+      </div>
+      <ul className="space-y-1.5 pl-6 list-disc marker:text-warning/50">
+        {shown.map((n) => (
+          <li key={n.id}>
+            <span>{n.text}</span>
+            {n.hint && <span className="block text-warning/70 text-xs mt-0.5">{n.hint}</span>}
+          </li>
+        ))}
+      </ul>
+      {!expanded && hiddenCount > 0 && (
+        <button
+          onClick={() => setExpanded(true)}
+          className="text-xs text-warning/80 hover:text-warning underline underline-offset-2 ml-6"
+        >
+          Show {hiddenCount} more
+        </button>
+      )}
+      {expanded && notes.length > VISIBLE && (
+        <button
+          onClick={() => setExpanded(false)}
+          className="text-xs text-warning/80 hover:text-warning underline underline-offset-2 ml-6"
+        >
+          Show less
+        </button>
+      )}
+    </div>
+  )
+}
+
 function getWeeks(plan: any): any[] {
   if (plan?.weeks && Array.isArray(plan.weeks)) return plan.weeks
   if (plan?.days && Array.isArray(plan.days)) {
@@ -295,31 +373,7 @@ export default function Plan() {
                 <span>{plan.plan.progression_assessment.readiness_note}</span>
               </div>
             )}
-            {plan.plan.progression_assessment?.note && (
-              <div className="flex items-start gap-2 bg-warning/10 border border-warning/20 rounded-xl p-3 text-sm text-warning">
-                <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
-                <span>{plan.plan.progression_assessment.note}</span>
-              </div>
-            )}
-            {plan.plan.capacity_feedback && (
-              <div className="flex items-start gap-2 bg-warning/10 border border-warning/20 rounded-xl p-3 text-sm text-warning">
-                <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
-                <span>{plan.plan.capacity_feedback}</span>
-              </div>
-            )}
-            {plan.plan.session_targets?.note && (
-              <div className="flex items-start gap-2 bg-warning/10 border border-warning/20 rounded-xl p-3 text-sm text-warning">
-                <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
-                <div>
-                  <span className="block">
-                    Could not fit every session you asked for — {plan.plan.session_targets.note}.
-                  </span>
-                  <span className="block text-warning/70 text-xs mt-1">
-                    Add hours, allow more sessions per day, or free up a rest day.
-                  </span>
-                </div>
-              </div>
-            )}
+            <PlanNotes notes={buildPlanNotes(plan.plan)} />
           </div>
 
           {/* Week tabs */}

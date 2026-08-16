@@ -73,6 +73,10 @@ export default function Onboarding() {
     has_power_meter: false,
     has_hr_monitor: true,
     auto_push: false,
+    recovery_mode: 'auto' as 'auto' | 'extended' | 'off',
+    recovery_cycle_weeks: null as number | null,
+    volume_progression_mode: 'ramp' as 'ramp' | 'steady',
+    training_style: 'standard' as 'standard' | 'norwegian',
     notes: '',
   })
 
@@ -432,17 +436,23 @@ function SessionsPerSport({ profile, update }: any) {
 
   const limits: Record<string, any> = profile.sport_limits || {}
   const sessionsFor = (sport: string): number | null => limits[sport]?.sessions ?? null
+  const longDayFor = (sport: string): string | null => limits[sport]?.long_day ?? null
+  const lockFor = (sport: string): boolean => Boolean(limits[sport]?.lock_sessions)
 
-  const setSessions = (sport: string, value: number | null) => {
+  const setLimit = (sport: string, key: string, value: any) => {
     const entry = { ...(limits[sport] || {}) }
-    if (value === null) delete entry.sessions
-    else entry.sessions = value
+    if (value === null || value === false) delete entry[key]
+    else entry[key] = value
     const next = { ...limits, [sport]: entry }
     // Drop the key entirely once nothing is set, so an untouched profile keeps
     // sending {} and the planner stays on its own frequency model.
     if (Object.keys(entry).length === 0) delete next[sport]
     update('sport_limits', next)
   }
+
+  const setSessions = (sport: string, value: number | null) => setLimit(sport, 'sessions', value)
+  const setLongDay = (sport: string, value: string | null) => setLimit(sport, 'long_day', value)
+  const setLock = (sport: string, value: boolean) => setLimit(sport, 'lock_sessions', value)
 
   const chosen = sports.filter((s) => sessionsFor(s.value) !== null)
   const total = chosen.reduce((sum, s) => sum + (sessionsFor(s.value) || 0), 0)
@@ -469,48 +479,84 @@ function SessionsPerSport({ profile, update }: any) {
         {sports.map((sport) => {
           const Icon = sport.icon
           const value = sessionsFor(sport.value)
+          const longDay = longDayFor(sport.value)
+          const locked = lockFor(sport.value)
           return (
             <div
               key={sport.value}
-              className="flex items-center gap-3 p-2.5 rounded-xl bg-bg-tertiary border border-white/5"
+              className="p-2.5 rounded-xl bg-bg-tertiary border border-white/5 space-y-2"
             >
-              <Icon className="w-4 h-4 text-slate-400 shrink-0" />
-              <span className="text-sm flex-1 min-w-0 truncate">{sport.label}</span>
-              <div className="flex items-center gap-1 shrink-0">
+              <div className="flex items-center gap-3">
+                <Icon className="w-4 h-4 text-slate-400 shrink-0" />
+                <span className="text-sm flex-1 min-w-0 truncate">{sport.label}</span>
+                <div className="flex items-center gap-1 shrink-0">
+                  <button
+                    onClick={() => setSessions(sport.value, null)}
+                    className={`px-2.5 py-1 text-[11px] rounded-lg transition-colors ${
+                      value === null
+                        ? 'bg-accent/20 text-accent border border-accent/30'
+                        : 'text-slate-500 border border-transparent hover:text-slate-300'
+                    }`}
+                  >
+                    Auto
+                  </button>
+                  <button
+                    onClick={() => setSessions(sport.value, Math.max(1, (value ?? 1) - 1))}
+                    disabled={value !== null && value <= 1}
+                    className="w-7 h-7 rounded-lg bg-bg-hover text-slate-300 disabled:opacity-30 hover:text-white transition-colors"
+                    aria-label={`Fewer ${sport.label} sessions`}
+                  >
+                    −
+                  </button>
+                  <span
+                    className={`w-6 text-center text-sm tabular-nums ${
+                      value === null ? 'text-slate-600' : 'font-medium'
+                    }`}
+                  >
+                    {value ?? '–'}
+                  </span>
+                  <button
+                    onClick={() =>
+                      setSessions(sport.value, Math.min(MAX_SESSIONS_PER_SPORT, (value ?? 0) + 1))
+                    }
+                    disabled={value !== null && value >= MAX_SESSIONS_PER_SPORT}
+                    className="w-7 h-7 rounded-lg bg-bg-hover text-slate-300 disabled:opacity-30 hover:text-white transition-colors"
+                    aria-label={`More ${sport.label} sessions`}
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 pl-7 flex-wrap">
+                <label className="text-[11px] text-slate-500 shrink-0">Long day</label>
+                <select
+                  value={longDay ?? ''}
+                  onChange={(e) => setLongDay(sport.value, e.target.value || null)}
+                  className="bg-bg-hover text-[11px] rounded-lg px-2 py-1 border border-white/5 text-slate-300 capitalize"
+                >
+                  <option value="">Auto</option>
+                  {DAYS.map((d) => (
+                    <option key={d} value={d}>{d.charAt(0).toUpperCase() + d.slice(1)}</option>
+                  ))}
+                </select>
+
                 <button
-                  onClick={() => setSessions(sport.value, null)}
-                  className={`px-2.5 py-1 text-[11px] rounded-lg transition-colors ${
-                    value === null
-                      ? 'bg-accent/20 text-accent border border-accent/30'
-                      : 'text-slate-500 border border-transparent hover:text-slate-300'
+                  onClick={() => setLock(sport.value, !locked)}
+                  disabled={value === null}
+                  title={value === null ? 'Set a session count first' : undefined}
+                  className={`flex items-center gap-1.5 px-2 py-1 text-[11px] rounded-lg border transition-colors disabled:opacity-30 ${
+                    locked
+                      ? 'bg-accent/15 border-accent/30 text-accent'
+                      : 'bg-transparent border-white/10 text-slate-500 hover:text-slate-300'
                   }`}
                 >
-                  Auto
-                </button>
-                <button
-                  onClick={() => setSessions(sport.value, Math.max(1, (value ?? 1) - 1))}
-                  disabled={value !== null && value <= 1}
-                  className="w-7 h-7 rounded-lg bg-bg-hover text-slate-300 disabled:opacity-30 hover:text-white transition-colors"
-                  aria-label={`Fewer ${sport.label} sessions`}
-                >
-                  −
-                </button>
-                <span
-                  className={`w-6 text-center text-sm tabular-nums ${
-                    value === null ? 'text-slate-600' : 'font-medium'
-                  }`}
-                >
-                  {value ?? '–'}
-                </span>
-                <button
-                  onClick={() =>
-                    setSessions(sport.value, Math.min(MAX_SESSIONS_PER_SPORT, (value ?? 0) + 1))
-                  }
-                  disabled={value !== null && value >= MAX_SESSIONS_PER_SPORT}
-                  className="w-7 h-7 rounded-lg bg-bg-hover text-slate-300 disabled:opacity-30 hover:text-white transition-colors"
-                  aria-label={`More ${sport.label} sessions`}
-                >
-                  +
+                  <span className={`w-3 h-3 rounded-sm border flex items-center justify-center ${
+                    locked ? 'bg-accent border-accent' : 'border-slate-500'
+                  }`}>
+                    {locked && <Check className="w-2.5 h-2.5 text-bg-primary" />}
+                  </span>
+                  Keep this count every week
                 </button>
               </div>
             </div>
@@ -582,6 +628,36 @@ function StepSchedule({ profile, update, toggleList }: any) {
             {profile.current_weekly_hours ?? profile.weekly_hours}h
           </span>
         </div>
+      </div>
+
+      <div>
+        <h2 className="text-sm font-medium mb-2">Volume Progression</h2>
+        <p className="text-xs text-slate-500 mb-2">How should weekly volume build toward your target?</p>
+        <div className="flex gap-2">
+          {[
+            { value: 'ramp', label: 'Ramp', desc: 'Steadily climbs to your target' },
+            { value: 'steady', label: 'Steady', desc: 'Ramps in briefly, then holds flat' },
+          ].map((opt) => (
+            <button
+              key={opt.value}
+              onClick={() => update('volume_progression_mode', opt.value)}
+              className={`flex-1 min-w-0 text-left p-3 rounded-xl transition-colors ${
+                profile.volume_progression_mode === opt.value
+                  ? 'bg-accent/15 border border-accent/30'
+                  : 'bg-bg-tertiary border border-white/5 hover:bg-bg-hover'
+              }`}
+            >
+              <div className="text-sm font-medium">{opt.label}</div>
+              <div className="text-[11px] text-slate-500">{opt.desc}</div>
+            </button>
+          ))}
+        </div>
+        {profile.volume_progression_mode === 'steady' && (
+          <p className="text-[11px] text-slate-500 mt-2">
+            Steady still ramps in for the first few weeks and won't jump more than ~15% above
+            your recent training — it's not a way to start at full volume cold.
+          </p>
+        )}
       </div>
 
       <div>
@@ -657,6 +733,54 @@ function StepSchedule({ profile, update, toggleList }: any) {
             </button>
           ))}
         </div>
+      </div>
+
+      <div>
+        <h2 className="text-sm font-medium mb-2">Recovery Weeks</h2>
+        <p className="text-xs text-slate-500 mb-2">How often should the plan back off for a recovery week?</p>
+        <div className="flex gap-2">
+          {[
+            { value: 'auto', label: 'Auto', desc: 'Derived from experience' },
+            { value: 'extended', label: 'Extended', desc: 'Longer build cycles' },
+            { value: 'off', label: 'Off', desc: 'Only when forced' },
+          ].map((opt) => (
+            <button
+              key={opt.value}
+              onClick={() => update('recovery_mode', opt.value)}
+              className={`flex-1 min-w-0 text-left p-3 rounded-xl transition-colors ${
+                profile.recovery_mode === opt.value
+                  ? 'bg-accent/15 border border-accent/30'
+                  : 'bg-bg-tertiary border border-white/5 hover:bg-bg-hover'
+              }`}
+            >
+              <div className="text-sm font-medium">{opt.label}</div>
+              <div className="text-[11px] text-slate-500 truncate">{opt.desc}</div>
+            </button>
+          ))}
+        </div>
+        {profile.recovery_mode === 'extended' && (
+          <div className="flex items-center gap-3 mt-2">
+            <label className="text-xs text-slate-400">Build cycle length</label>
+            <input
+              type="number"
+              min={1}
+              max={8}
+              value={profile.recovery_cycle_weeks ?? ''}
+              placeholder="weeks"
+              onChange={(e) => {
+                const raw = e.target.value
+                if (raw === '') { update('recovery_cycle_weeks', null); return }
+                const clamped = Math.min(8, Math.max(1, Number(raw)))
+                update('recovery_cycle_weeks', clamped)
+              }}
+              className="w-20 bg-bg-tertiary text-sm rounded-lg px-2 py-1.5 border border-white/5"
+            />
+            <span className="text-xs text-slate-500">weeks between recovery weeks</span>
+          </div>
+        )}
+        <p className="text-[11px] text-slate-500 mt-2">
+          Off still forces a recovery week after a stretch of hard weeks — it's not a true disable.
+        </p>
       </div>
 
       <div>
@@ -746,6 +870,8 @@ function StepEquipment({ profile, update }: any) {
         </button>
       </div>
 
+      <TrainingStyleToggle profile={profile} update={update} />
+
       <div>
         <label className="text-xs text-slate-400 block mb-1">Additional Notes</label>
         <textarea
@@ -756,6 +882,47 @@ function StepEquipment({ profile, update }: any) {
           className="w-full bg-bg-tertiary text-sm rounded-xl px-3 py-2.5 border border-white/5 placeholder:text-slate-600 resize-none"
         />
       </div>
+    </div>
+  )
+}
+
+/** Backend hard-enforces weekly_hours >= 12 and ramp-stability at generation
+ *  time regardless of this toggle — the gate here is just steering the
+ *  athlete before they hit a no-op, not the actual guard. */
+function TrainingStyleToggle({ profile, update }: any) {
+  const eligible = profile.weekly_hours >= 12 && profile.experience_level === 'advanced'
+  const active = profile.training_style === 'norwegian'
+
+  return (
+    <div>
+      <h2 className="text-sm font-medium mb-2">Training Style</h2>
+      <p className="text-xs text-slate-500 mb-2">
+        Norwegian-style double-threshold days, restructuring quality sessions into an AM/PM pair.
+      </p>
+      <button
+        onClick={() => eligible && update('training_style', active ? 'standard' : 'norwegian')}
+        disabled={!eligible}
+        className={`flex items-center gap-3 p-3 rounded-xl w-full transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+          active
+            ? 'bg-accent/15 border border-accent/30'
+            : 'bg-bg-tertiary border border-white/5 hover:enabled:bg-bg-hover'
+        }`}
+      >
+        <div className={`w-10 h-6 rounded-full relative transition-colors ${
+          active ? 'bg-accent' : 'bg-slate-700'
+        }`}>
+          <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-transform ${
+            active ? 'left-5' : 'left-1'
+          }`} />
+        </div>
+        <span className="text-sm">{active ? 'Norwegian' : 'Standard'}</span>
+      </button>
+      {!eligible && (
+        <p className="text-[11px] text-warning mt-2">
+          Needs 12+ weekly hours and Advanced experience — currently{' '}
+          {profile.weekly_hours}h and {profile.experience_level || 'not set'}.
+        </p>
+      )}
     </div>
   )
 }
@@ -776,6 +943,22 @@ function statedSessions(profile: any): string {
     .join(', ')
 }
 
+/** "Cycling → Saturday, Running → Sunday" for sports with a pinned long day. */
+function statedLongDays(profile: any): string {
+  const limits: Record<string, any> = profile.sport_limits || {}
+  return SPORTS.filter((s) => profile.sports.includes(s.value) && limits[s.value]?.long_day)
+    .map((s) => `${s.label} → ${limits[s.value].long_day.charAt(0).toUpperCase()}${limits[s.value].long_day.slice(1)}`)
+    .join(', ')
+}
+
+/** Sports whose session count is locked (held flat rather than scaled during ramp/recovery weeks). */
+function statedLocks(profile: any): string {
+  const limits: Record<string, any> = profile.sport_limits || {}
+  return SPORTS.filter((s) => profile.sports.includes(s.value) && limits[s.value]?.lock_sessions)
+    .map((s) => s.label)
+    .join(', ')
+}
+
 function StepReview({ profile, isGenerating, planStart, setPlanStart }: any) {
   const items = [
     { label: 'Experience', value: labelFor(profile.experience_level, EXPERIENCE_LEVELS) },
@@ -789,6 +972,10 @@ function StepReview({ profile, isGenerating, planStart, setPlanStart }: any) {
       value: `${profile.current_weekly_hours ?? profile.weekly_hours}h — plan ramps toward ${profile.weekly_hours}h`,
     },
     {
+      label: 'Volume Progression',
+      value: profile.volume_progression_mode === 'steady' ? 'Steady (ramp-in, then hold)' : 'Ramp',
+    },
+    {
       label: 'Sessions/Day',
       value: profile.max_sessions_per_day >= 2
         ? `Up to ${profile.max_sessions_per_day}`
@@ -798,8 +985,16 @@ function StepReview({ profile, isGenerating, planStart, setPlanStart }: any) {
       label: 'Sessions/Sport',
       value: statedSessions(profile) || 'Auto — set from your weekly hours',
     },
+    { label: 'Long Days', value: statedLongDays(profile) || 'Auto' },
+    { label: 'Locked Counts', value: statedLocks(profile) || 'None' },
     { label: 'Hard Days', value: profile.preferred_hard_days.map((d: string) => d.charAt(0).toUpperCase() + d.slice(1, 3)).join(', ') },
     { label: 'Rest Days', value: profile.preferred_rest_days.map((d: string) => d.charAt(0).toUpperCase() + d.slice(1, 3)).join(', ') },
+    {
+      label: 'Recovery Weeks',
+      value: profile.recovery_mode === 'extended'
+        ? `Extended${profile.recovery_cycle_weeks ? ` (every ${profile.recovery_cycle_weeks}w)` : ''}`
+        : profile.recovery_mode === 'off' ? 'Off (until forced)' : 'Auto',
+    },
     { label: 'Plan Duration', value: `${profile.plan_duration_weeks} weeks` },
     { label: 'Equipment', value: [
       profile.has_trainer && 'Trainer',
@@ -807,6 +1002,7 @@ function StepReview({ profile, isGenerating, planStart, setPlanStart }: any) {
       profile.has_hr_monitor && 'HR Monitor',
     ].filter(Boolean).join(', ') || 'None' },
     { label: 'Auto-Push', value: profile.auto_push ? 'Daily at 5 AM' : 'Off' },
+    { label: 'Training Style', value: profile.training_style === 'norwegian' ? 'Norwegian' : 'Standard' },
   ]
 
   return (
