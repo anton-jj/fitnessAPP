@@ -162,6 +162,12 @@ class AthleteProfile(Base):
     # "standard" (methodology-agnostic, the default) or "norwegian"
     # (double-threshold days named and coached explicitly).
     training_style = Column(String, default="standard")
+    # Which discipline wins a quality/hard day when more than one wants it,
+    # e.g. ["cycling", "running", "swimming"] to always prefer bike, then
+    # run, over swim. Unset = only the primary sport gets a hard preference;
+    # see plan_builder.build_plan's quality_priority comment for why a full
+    # default ordering isn't inferred automatically.
+    quality_sport_priority = Column(JSON)
     auto_push = Column(Boolean, default=False)  # auto-push workouts to watch daily
     notes = Column(Text)
     onboarding_complete = Column(Boolean, default=False)

@@ -40,6 +40,7 @@ class ProfileUpdate(BaseModel):
     recovery_cycle_weeks: Optional[int] = None
     volume_progression_mode: Optional[str] = None
     training_style: Optional[str] = None
+    quality_sport_priority: Optional[list[str]] = None
     auto_push: Optional[bool] = None
     notes: Optional[str] = None
     onboarding_complete: Optional[bool] = None
@@ -230,6 +231,7 @@ def _serialize(profile: AthleteProfile) -> dict:
         "recovery_cycle_weeks": profile.recovery_cycle_weeks,
         "volume_progression_mode": profile.volume_progression_mode or "ramp",
         "training_style": profile.training_style or "standard",
+        "quality_sport_priority": profile.quality_sport_priority or [],
         "auto_push": profile.auto_push,
         "notes": profile.notes,
         "onboarding_complete": profile.onboarding_complete,

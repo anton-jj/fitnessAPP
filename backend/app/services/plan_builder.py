@@ -671,6 +671,18 @@ MAX_RECOVERY_CYCLE_EXTENSION_WEEKS = 8
 # compute_recovery_schedule.
 MAX_CONSECUTIVE_BUILD_WEEKS = {"beginner": 6, "intermediate": 8, "advanced": 10}
 
+# An athlete can ask for zero hard swim sessions via quality_sport_priority,
+# but not indefinitely — CSS pacing and technique-under-fatigue erode within
+# a handful of weeks without any faster-than-endurance stimulus. Bounded, not
+# a true disable, same shape as MAX_CONSECUTIVE_BUILD_WEEKS above.
+MAX_CONSECUTIVE_WEEKS_ZERO_QUALITY_SWIM = 4
+
+# Inside this many weeks of the goal event, at least one quality/moderate
+# swim slot happens regardless of quality_sport_priority — race-day swim
+# performance (holding pace in contact/chop) depends on recent rehearsal
+# more than accumulated base.
+PRE_RACE_SWIM_QUALITY_FLOOR_WEEKS = 6
+
 
 def compute_recovery_schedule(total_weeks: int, experience: str,
                               recovery_mode: str = "auto",
@@ -1042,15 +1054,23 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
                           total_sessions: int,
                           max_sessions_per_day: int = 1,
                           limits: dict | None = None,
-                          requested: dict[str, int] | None = None) -> list[dict]:
+                          requested: dict[str, int] | None = None,
+                          quality_priority: list[str] | None = None) -> list[dict]:
     """Place every session of the week on a day.
 
     Returns a flat list of {day, sport} slots — more than one per day once the
     volume calls for it. Session counts come from the frequency model, so this
     only decides placement: an athlete's explicit long-session day claims its
-    day first, quality days then go to different disciplines, weekend days to
-    whichever sport carries the longest session, and second sessions land on
-    the lightest non-quality days in a different sport from the first.
+    day first, quality days then go to the highest-ranked discipline still
+    available (`quality_priority`), weekend days to whichever sport carries
+    the longest session, and second sessions land on the lightest non-quality
+    days in a different sport from the first.
+
+    `quality_priority` is a full ranking, not a tie-break bonus: the
+    highest-ranked sport with a session left wins a quality day outright,
+    even over a sport with more total sessions remaining that week. Pass
+    `None` (or omit a sport from the list) to fall back to the plain
+    session-count heuristic for that sport.
     """
     real_sports = [s for s in sports if s != "strength"]
     if not real_sports:
@@ -1097,9 +1117,13 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
             place(sport, day)
             pinned_long_days[sport] = day
 
-    # 2. Quality days — one per discipline where possible. Skips a day a pin
-    # above already filled to capacity, so an explicit long-day request is
-    # never bumped by the quality-day round robin.
+    # 2. Quality days — the highest-ranked discipline still available claims
+    # each one outright (see docstring). Skips a day a pin above already
+    # filled to capacity, so an explicit long-day request is never bumped by
+    # the quality-day round robin.
+    priority_rank = {
+        s: len(quality_priority) - i for i, s in enumerate(quality_priority or [])
+    }
     quality_used: set[str] = set()
     for day in quality_days:
         if len(day_sports.get(day, set())) >= max_sessions_per_day:
@@ -1108,9 +1132,21 @@ def _build_sport_schedule(sports: list[str], quality_days: list[str],
         if not available:
             continue
         fresh = [s for s in available if s not in quality_used] or available
-        pick = max(fresh, key=lambda s: (remaining[s], s == primary_sport))
+        pick = max(fresh, key=lambda s: (
+            priority_rank.get(s, -1), remaining[s], s == primary_sport,
+        ))
         quality_used.add(pick)
         place(pick, day)
+
+        # An athlete with same-day access (e.g. a pool at the gym they cycle
+        # to) can ask for a specific sport to land alongside a given
+        # discipline's quality session — opt-in only, never a default, since
+        # it assumes a same-day facility most athletes will not have.
+        pair_sport = (limits or {}).get(pick, {}).get("quality_pm_pair")
+        if (pair_sport and pair_sport != pick and max_sessions_per_day > 1
+                and remaining.get(pair_sport, 0) > 0 and allowed(pair_sport, day)
+                and len(day_sports.get(day, set())) < max_sessions_per_day):
+            place(pair_sport, day)
 
     # 3. Weekends carry the long sessions.
     leftover = [d for d in easy_days if d not in day_sports]
@@ -2126,6 +2162,31 @@ def build_plan(profile: dict, ftp: int,
         if (sport_limits.get(sport) or {}).get("lock_sessions")
     }
 
+    # Which discipline gets a quality/hard day when more than one wants it.
+    # An explicit list overrides outright — e.g. an athlete who wants bike to
+    # take every hard day and swim none of them, trading some swim-quality
+    # floor protection below for it (see the two constants above). Left
+    # unstated, only the primary sport gets a hard preference (already
+    # cycling-biased for triathlon events via EVENT_PRIMARY_SPORT); the rest
+    # keep competing on remaining session count as before. A full stress-
+    # factor-ordered default was tried and rejected — it systematically
+    # pushed running behind swimming for every quality day even when nobody
+    # asked for that, and running's larger session floor made it vulnerable
+    # to being dropped outright by the duration allocator at tight volume
+    # (see test_triathlon_frequency_ladder). Ordering every discipline is a
+    # deliberate choice for the athlete to make, not a safe default to infer.
+    stated_priority = profile.get("quality_sport_priority")
+    if stated_priority:
+        quality_priority = [s for s in stated_priority if s in real_sports]
+    else:
+        quality_priority = [primary_sport] if primary_sport in real_sports else []
+
+    # How many consecutive non-recovery/taper weeks swimming has gone without
+    # a quality slot — forces one back in past MAX_CONSECUTIVE_WEEKS_ZERO_
+    # QUALITY_SWIM or inside PRE_RACE_SWIM_QUALITY_FLOOR_WEEKS of the event,
+    # regardless of quality_sport_priority. See those constants' comments.
+    weeks_since_quality_swim = 0
+
     # Where the ramp starts. Synced history beats the onboarding slider, and an
     # explicit answer from the athlete beats both.
     current_hours, volume_source = _resolve_starting_volume(profile)
@@ -2235,15 +2296,41 @@ def build_plan(profile: dict, ftp: int,
             week_minutes / 60, len(real_sports), len(week_training_days),
             max_sessions_per_day, week_requested,
         )
+
+        # A swim quality-priority forced back in for this week only, on top
+        # of whatever the athlete asked for — see the two constants' comments.
+        week_quality_priority = quality_priority
+        if "swimming" in real_sports and week_type not in ("recovery", "taper"):
+            weeks_until_event = (
+                total_weeks - week_num if profile.get("goal_event") else None
+            )
+            force_swim_quality = (
+                weeks_since_quality_swim >= MAX_CONSECUTIVE_WEEKS_ZERO_QUALITY_SWIM
+                or (weeks_until_event is not None
+                    and weeks_until_event <= PRE_RACE_SWIM_QUALITY_FLOOR_WEEKS)
+            )
+            if force_swim_quality and "swimming" in quality_priority:
+                week_quality_priority = (
+                    ["swimming"] + [s for s in quality_priority if s != "swimming"]
+                )
+
         sport_schedule = _build_sport_schedule(
             sports, week_quality_days, week_easy_days, primary_sport,
             session_target, max_sessions_per_day, sport_limits, week_requested,
+            week_quality_priority,
         )
         base_slots = _assign_archetypes(
             sport_schedule, week_quality_days, capacity["long_session_essential"],
             sport_limits,
         )
         slots, unfitted = _allocate_slot_durations(base_slots, week_minutes, week_type)
+
+        if "swimming" in real_sports and week_type not in ("recovery", "taper"):
+            if any(s["sport"] == "swimming" and s["archetype"] == "quality"
+                   for s in base_slots):
+                weeks_since_quality_swim = 0
+            else:
+                weeks_since_quality_swim += 1
 
         quality_types = _pick_quality_types(week_quality, week_num)
         for idx, slot in enumerate(s for s in slots if s["archetype"] == "quality"):
