@@ -1,50 +1,155 @@
-import { useState, useCallback } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api/client'
-import {
-  format, startOfMonth, endOfMonth, startOfWeek, endOfWeek,
-  eachDayOfInterval, isSameMonth, isToday, addMonths, subMonths,
-} from 'date-fns'
-import { ChevronLeft, ChevronRight, AlertTriangle, GripVertical } from 'lucide-react'
+import { format, addMonths, subMonths } from 'date-fns'
+import { ChevronLeft, ChevronRight, AlertTriangle, CalendarDays } from 'lucide-react'
+import QuickPlanCta from '../components/calendar/QuickPlanCta'
+import PlanHeader from '../components/calendar/PlanHeader'
+import MonthGrid from '../components/calendar/MonthGrid'
+import DayDetailPanel from '../components/calendar/DayDetailPanel'
 
-const sportColors: Record<string, string> = {
-  running: 'bg-sport-running',
-  cycling: 'bg-sport-cycling',
-  swimming: 'bg-sport-swimming',
-  strength: 'bg-sport-strength',
+function getWeeks(plan: any): any[] {
+  if (plan?.weeks && Array.isArray(plan.weeks)) return plan.weeks
+  if (plan?.days && Array.isArray(plan.days)) {
+    return [{ week_number: 1, week_type: 'build', focus: '', target_hours: plan.total_hours, target_tss: plan.total_tss, days: plan.days }]
+  }
+  return []
 }
 
-const DAY_NAMES = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+// Locates the live `days` array inside a plan payload so an optimistic swap
+// can mutate it directly, in whatever shape the plan actually uses
+// (multi-week `weeks[]`, or a single flat `days[]`) — mirrors getWeeks above
+// but returns a reference into the real object instead of a synthetic wrapper.
+function findWeekDays(planData: any, weekNumber: number): any[] | null {
+  if (planData?.weeks && Array.isArray(planData.weeks)) {
+    return planData.weeks.find((w: any) => w.week_number === weekNumber)?.days ?? null
+  }
+  if (planData?.days && Array.isArray(planData.days)) {
+    return planData.days
+  }
+  return null
+}
 
-function getDayName(date: Date): string {
-  return DAY_NAMES[(date.getDay() + 6) % 7]
+interface PlannedDay {
+  weekNumber: number
+  dayName: string
+  workouts: any[]
+}
+
+function hasNonRestWorkout(pd?: PlannedDay): boolean {
+  return Boolean(pd?.workouts?.some((w: any) => w.workout_type !== 'rest'))
 }
 
 export default function Calendar() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [currentMonth, setCurrentMonth] = useState(new Date())
-  const [dragItem, setDragItem] = useState<{
-    dateKey: string; index: number; workout: any
-  } | null>(null)
-  const [dropTarget, setDropTarget] = useState<string | null>(null)
+  const [selectedDate, setSelectedDate] = useState<string>(() => format(new Date(), 'yyyy-MM-dd'))
+  const [swapSource, setSwapSource] = useState<{ date: string; index: number } | null>(null)
   const [advice, setAdvice] = useState<string | null>(null)
+  const autoSelectedRef = useRef(false)
 
   const year = currentMonth.getFullYear()
   const month = currentMonth.getMonth() + 1
 
-  const { data: calendarData = {} } = useQuery({
-    queryKey: ['calendar', year, month],
-    queryFn: () => api.calendar(year, month),
-  })
-
-  const { data: currentPlan } = useQuery({
+  const { data: plan, isLoading: planLoading } = useQuery({
     queryKey: ['plan'],
     queryFn: () => api.currentPlan(),
   })
 
-  const moveMutation = useMutation({
+  const { data: calendarData = {}, isLoading: calendarLoading } = useQuery({
+    queryKey: ['calendar', year, month],
+    queryFn: () => api.calendar(year, month),
+  })
+
+  const { data: compliance } = useQuery({
+    queryKey: ['compliance', plan?.id],
+    queryFn: () => api.planCompliance(plan.id),
+    enabled: Boolean(plan?.id),
+  })
+
+  const hasPlan = Boolean(plan && plan.plan)
+  const weeks = useMemo(() => (hasPlan ? getWeeks(plan.plan) : []), [hasPlan, plan])
+
+  const plannedByDate = useMemo(() => {
+    const map: Record<string, PlannedDay> = {}
+    for (const w of weeks) {
+      for (const d of w.days || []) {
+        if (!d.date) continue
+        map[d.date] = {
+          weekNumber: w.week_number,
+          dayName: (d.day || '').toLowerCase(),
+          // A rest day is stored as an explicit workout_type "rest"
+          // placeholder, not an empty array — filter it out here so
+          // downstream consumers (grid chip count, swap eligibility, day
+          // panel) never treat "rest" as a real, swappable session.
+          workouts: (d.workouts || []).filter((w: any) => w.workout_type !== 'rest'),
+        }
+      }
+    }
+    return map
+  }, [weeks])
+
+  const currentWeek = useMemo(() => {
+    const wn = plannedByDate[selectedDate]?.weekNumber
+    if (wn == null) return null
+    return weeks.find((w: any) => w.week_number === wn) ?? null
+  }, [plannedByDate, selectedDate, weeks])
+
+  // Default the selected date to today if there's anything to see there;
+  // otherwise land on the nearest upcoming planned workout so the panel
+  // doesn't open empty. Runs once, after both queries have settled.
+  useEffect(() => {
+    if (autoSelectedRef.current) return
+    if (planLoading || calendarLoading) return
+    autoSelectedRef.current = true
+    const todayKey = format(new Date(), 'yyyy-MM-dd')
+    const hasToday = hasNonRestWorkout(plannedByDate[todayKey]) || (calendarData[todayKey] || []).length > 0
+    if (!hasToday) {
+      const upcoming = Object.keys(plannedByDate)
+        .filter((k) => k >= todayKey && hasNonRestWorkout(plannedByDate[k]))
+        .sort()[0]
+      if (upcoming) setSelectedDate(upcoming)
+    }
+  }, [planLoading, calendarLoading, plannedByDate, calendarData])
+
+  const adjust = useMutation({
+    mutationFn: ({ action, details, week_number }: { action: string; details: string; week_number?: number }) =>
+      api.adjustPlan(plan.id, action, details, week_number),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['plan'] }),
+  })
+
+  // Swapping two workouts is a pure data move — no AI judgment call needed —
+  // so it applies instantly against the local cache and persists deterministically
+  // in the background, instead of paying for a slow full-week AI rewrite.
+  const swapWorkout = useMutation({
+    mutationFn: (vars: { week_number: number; day_a: string; index_a: number; day_b: string; index_b: number }) =>
+      api.swapWorkout({ plan_id: plan.id, ...vars }),
+    onMutate: async (vars) => {
+      await queryClient.cancelQueries({ queryKey: ['plan'] })
+      const previous = queryClient.getQueryData(['plan'])
+      queryClient.setQueryData(['plan'], (old: any) => {
+        if (!old?.plan) return old
+        const next = structuredClone(old)
+        const days = findWeekDays(next.plan, vars.week_number)
+        const dayA = days?.find((d: any) => d.day === vars.day_a)
+        const dayB = days?.find((d: any) => d.day === vars.day_b)
+        const wa = dayA?.workouts
+        const wb = dayB?.workouts
+        if (!wa || !wb || vars.index_a >= wa.length || vars.index_b >= wb.length) return old
+        ;[wa[vars.index_a], wb[vars.index_b]] = [wb[vars.index_b], wa[vars.index_a]]
+        return next
+      })
+      return { previous }
+    },
+    onError: (_err, _vars, context) => {
+      if (context?.previous) queryClient.setQueryData(['plan'], context.previous)
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ['plan'] }),
+  })
+
+  const moveWorkout = useMutation({
     mutationFn: (data: { plan_id: number; week_number: number; from_day: string; from_index: number; to_day: string }) =>
       api.moveWorkout(data),
     onSuccess: (result) => {
@@ -57,201 +162,171 @@ export default function Calendar() {
     },
   })
 
-  const findPlanWeek = useCallback((dateKey: string): { planId: number; weekNumber: number } | null => {
-    if (!currentPlan?.id || !currentPlan?.plan) return null
+  const pushToWatch = useMutation({
+    mutationFn: ({ workout, date }: { workout: any; date: string }) =>
+      api.pushToWatch(workout, date),
+  })
 
-    const weeks = currentPlan.plan.weeks || []
-    for (const w of weeks) {
-      for (const d of w.days || []) {
-        if (d.date === dateKey) {
-          return { planId: currentPlan.id, weekNumber: w.week_number }
-        }
-      }
-    }
+  const pushWeek = useMutation({
+    mutationFn: (weekNumber?: number) => api.pushPlan(plan.id, weekNumber),
+  })
 
-    if (currentPlan.plan.days) {
-      for (const d of currentPlan.plan.days) {
-        if (d.date === dateKey) {
-          return { planId: currentPlan.id, weekNumber: 1 }
-        }
-      }
-    }
-    return null
-  }, [currentPlan])
+  const adapt = useMutation({
+    mutationFn: () => api.adaptPlan(plan.id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['plan'] })
+      queryClient.invalidateQueries({ queryKey: ['compliance'] })
+      queryClient.invalidateQueries({ queryKey: ['calendar'] })
+    },
+  })
 
-  const handleDragStart = (dateKey: string, index: number, workout: any) => {
-    setDragItem({ dateKey, index, workout })
-  }
+  const deletePlan = useMutation({
+    mutationFn: (planId: number) => api.deletePlan(planId),
+    onSuccess: () => {
+      queryClient.setQueryData(['plan'], null)
+      queryClient.invalidateQueries({ queryKey: ['plan'] })
+      queryClient.invalidateQueries({ queryKey: ['calendar'] })
+    },
+  })
 
-  const handleDragOver = (e: React.DragEvent, dateKey: string) => {
-    e.preventDefault()
-    setDropTarget(dateKey)
-  }
-
-  const handleDragLeave = () => {
-    setDropTarget(null)
-  }
-
-  const handleDrop = (e: React.DragEvent, toDateKey: string) => {
-    e.preventDefault()
-    setDropTarget(null)
-
-    if (!dragItem || dragItem.dateKey === toDateKey) {
-      setDragItem(null)
+  const completeSwap = useCallback((targetDate: string, targetIndex: number) => {
+    if (!swapSource) return
+    const sourceInfo = plannedByDate[swapSource.date]
+    const targetInfo = plannedByDate[targetDate]
+    if (!sourceInfo || !targetInfo) {
+      setSwapSource(null)
       return
     }
-
-    const fromDate = new Date(dragItem.dateKey)
-    const toDate = new Date(toDateKey)
-    const planInfo = findPlanWeek(dragItem.dateKey)
-
-    if (!planInfo) {
-      setDragItem(null)
+    if (sourceInfo.weekNumber !== targetInfo.weekNumber) {
+      setAdvice('Can only swap workouts within the same week')
+      setTimeout(() => setAdvice(null), 4000)
+      setSwapSource(null)
       return
     }
+    swapWorkout.mutate({
+      week_number: sourceInfo.weekNumber,
+      day_a: sourceInfo.dayName,
+      index_a: swapSource.index,
+      day_b: targetInfo.dayName,
+      index_b: targetIndex,
+    })
+    setSwapSource(null)
+  }, [swapSource, plannedByDate, swapWorkout])
 
-    const toWeekInfo = findPlanWeek(toDateKey)
-    if (!toWeekInfo || toWeekInfo.weekNumber !== planInfo.weekNumber) {
+  const handleDropWorkout = useCallback((fromDate: string, fromIndex: number, toDate: string) => {
+    if (!plan?.id) return
+    const fromInfo = plannedByDate[fromDate]
+    const toInfo = plannedByDate[toDate]
+    if (!fromInfo) return
+    if (!toInfo || toInfo.weekNumber !== fromInfo.weekNumber) {
       setAdvice('Can only move workouts within the same week')
       setTimeout(() => setAdvice(null), 4000)
-      setDragItem(null)
       return
     }
-
-    const plannedBefore = (calendarData[dragItem.dateKey] || [])
-      .filter((a: any) => a.planned)
-    const fromIndex = plannedBefore.findIndex((_: any, i: number) => {
-      const allItems = calendarData[dragItem.dateKey] || []
-      const plannedIdx = allItems.filter((a: any) => a.planned).indexOf(plannedBefore[i])
-      return i === dragItem.index
+    moveWorkout.mutate({
+      plan_id: plan.id,
+      week_number: fromInfo.weekNumber,
+      from_day: fromInfo.dayName,
+      from_index: fromIndex,
+      to_day: toInfo.dayName,
     })
+  }, [plan, plannedByDate, moveWorkout])
 
-    moveMutation.mutate({
-      plan_id: planInfo.planId,
-      week_number: planInfo.weekNumber,
-      from_day: getDayName(fromDate),
-      from_index: dragItem.index,
-      to_day: getDayName(toDate),
-    })
-
-    setDragItem(null)
+  const toggleSwapSource = (index: number) => {
+    if (swapSource && swapSource.date === selectedDate && swapSource.index === index) {
+      setSwapSource(null)
+    } else {
+      setSwapSource({ date: selectedDate, index })
+    }
   }
-
-  const monthStart = startOfMonth(currentMonth)
-  const monthEnd = endOfMonth(currentMonth)
-  const calStart = startOfWeek(monthStart, { weekStartsOn: 1 })
-  const calEnd = endOfWeek(monthEnd, { weekStartsOn: 1 })
-  const days = eachDayOfInterval({ start: calStart, end: calEnd })
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <h1 className="text-xl font-bold">Calendar</h1>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setCurrentMonth(subMonths(currentMonth, 1))}
-            className="p-1.5 rounded-lg bg-bg-secondary hover:bg-bg-hover transition-colors"
-          >
-            <ChevronLeft className="w-4 h-4" />
-          </button>
-          <span className="text-sm font-medium min-w-[120px] text-center">
-            {format(currentMonth, 'MMMM yyyy')}
-          </span>
-          <button
-            onClick={() => setCurrentMonth(addMonths(currentMonth, 1))}
-            className="p-1.5 rounded-lg bg-bg-secondary hover:bg-bg-hover transition-colors"
-          >
-            <ChevronRight className="w-4 h-4" />
-          </button>
-        </div>
+        <h1 className="text-xl font-bold flex items-center gap-2">
+          <CalendarDays className="w-5 h-5 text-accent" /> Calendar
+        </h1>
       </div>
 
-      {advice && (
-        <div className="flex items-start gap-2 bg-accent/10 border border-accent/20 rounded-xl p-3 text-sm text-accent">
-          <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
-          <span>{advice}</span>
-        </div>
-      )}
+      {planLoading ? (
+        <div className="flex items-center justify-center h-64 text-slate-500">Loading...</div>
+      ) : (
+        <>
+          {!hasPlan && <QuickPlanCta />}
 
-      <div className="bg-bg-secondary rounded-xl border border-white/5 overflow-hidden">
-        <div className="grid grid-cols-7 text-xs text-slate-500 border-b border-white/5">
-          {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map((d) => (
-            <div key={d} className="py-2 text-center font-medium">{d}</div>
-          ))}
-        </div>
-        <div className="grid grid-cols-7">
-          {days.map((day) => {
-            const dateKey = format(day, 'yyyy-MM-dd')
-            const dayActivities = calendarData[dateKey] || []
-            const inMonth = isSameMonth(day, currentMonth)
-            const today = isToday(day)
-            const isDropping = dropTarget === dateKey
+          {hasPlan && (
+            <PlanHeader
+              plan={plan}
+              currentWeek={currentWeek}
+              compliance={compliance}
+              adapt={adapt}
+              pushWeek={pushWeek}
+              deletePlan={deletePlan}
+              onNewPlan={() => queryClient.setQueryData(['plan'], null)}
+              onEditSetup={() => navigate('/onboarding')}
+            />
+          )}
 
-            return (
-              <div
-                key={dateKey}
-                onDragOver={(e) => handleDragOver(e, dateKey)}
-                onDragLeave={handleDragLeave}
-                onDrop={(e) => handleDrop(e, dateKey)}
-                className={`min-h-[80px] md:min-h-[100px] p-1.5 border-b border-r border-white/5 transition-colors ${
-                  !inMonth ? 'opacity-30' : ''
-                } ${today ? 'bg-accent/5' : ''} ${
-                  isDropping ? 'bg-accent/10 ring-1 ring-accent/30 ring-inset' : ''
-                }`}
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-medium">{format(currentMonth, 'MMMM yyyy')}</span>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setCurrentMonth(subMonths(currentMonth, 1))}
+                className="p-1.5 rounded-lg bg-bg-secondary hover:bg-bg-hover transition-colors"
               >
-                <div className={`text-xs mb-1 ${today ? 'text-accent font-bold' : 'text-slate-500'}`}>
-                  {format(day, 'd')}
-                </div>
-                <div className="space-y-0.5">
-                  {dayActivities.slice(0, 4).map((a: any, i: number) => {
-                    const isPlanned = a.planned
-                    const plannedItems = dayActivities.filter((x: any) => x.planned)
-                    const plannedIndex = isPlanned ? plannedItems.indexOf(a) : -1
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => setCurrentMonth(addMonths(currentMonth, 1))}
+                className="p-1.5 rounded-lg bg-bg-secondary hover:bg-bg-hover transition-colors"
+              >
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
 
-                    return (
-                      <div
-                        key={i}
-                        draggable={isPlanned}
-                        onDragStart={() => isPlanned && handleDragStart(dateKey, plannedIndex, a)}
-                        onClick={() => a.id && navigate(`/activities/${a.id}`)}
-                        className={`text-[10px] px-1 py-0.5 rounded truncate transition-colors flex items-center gap-0.5 ${
-                          isPlanned
-                            ? 'border border-dashed border-white/10 bg-white/[0.02] text-slate-400 cursor-grab active:cursor-grabbing hover:border-accent/30'
-                            : 'cursor-pointer bg-bg-hover hover:bg-bg-tertiary text-slate-300'
-                        }`}
-                      >
-                        {isPlanned && (
-                          <GripVertical className="w-2.5 h-2.5 opacity-30 flex-shrink-0" />
-                        )}
-                        {/* The dashed border already says "planned" — let the dot
-                            carry the sport so a month reads at a glance. */}
-                        <span
-                          className={`inline-block w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-                            sportColors[a.sport_type] || 'bg-sport-other'
-                          }`}
-                        />
-                        <span className="hidden md:inline truncate ml-0.5">{a.name || a.sport_type}</span>
-                        <span className="md:hidden ml-0.5">{a.sport_type?.slice(0, 3)}</span>
-                      </div>
-                    )
-                  })}
-                  {dayActivities.length > 4 && (
-                    <div className="text-[10px] text-slate-500 px-1">
-                      +{dayActivities.length - 4} more
-                    </div>
-                  )}
-                </div>
-              </div>
-            )
-          })}
-        </div>
-      </div>
+          {advice && (
+            <div className="flex items-start gap-2 bg-accent/10 border border-accent/20 rounded-xl p-3 text-sm text-accent">
+              <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+              <span>{advice}</span>
+            </div>
+          )}
 
-      {moveMutation.isPending && (
-        <p className="text-xs text-slate-500 text-center">Moving workout...</p>
-      )}
-      {moveMutation.isError && (
-        <p className="text-xs text-danger text-center">Failed to move workout. Only planned workouts within the same week can be moved.</p>
+          {calendarLoading ? (
+            <div className="flex items-center justify-center h-32 text-slate-500">Loading calendar...</div>
+          ) : (
+            <MonthGrid
+              currentMonth={currentMonth}
+              calendarData={calendarData}
+              plannedByDate={plannedByDate}
+              selectedDate={selectedDate}
+              onSelectDate={setSelectedDate}
+              swapSource={swapSource}
+              onCompleteSwap={completeSwap}
+              onDropWorkout={handleDropWorkout}
+            />
+          )}
+
+          {moveWorkout.isPending && (
+            <p className="text-xs text-slate-500 text-center">Moving workout...</p>
+          )}
+          {moveWorkout.isError && (
+            <p className="text-xs text-danger text-center">Failed to move workout. Only planned workouts within the same week can be moved.</p>
+          )}
+
+          <DayDetailPanel
+            date={selectedDate}
+            displayDate={format(new Date(`${selectedDate}T00:00:00`), 'EEEE, MMM d')}
+            dayInfo={plannedByDate[selectedDate] ?? null}
+            activities={calendarData[selectedDate] || []}
+            swapActive={swapSource != null}
+            swapSourceIndex={swapSource && swapSource.date === selectedDate ? swapSource.index : null}
+            onToggleSwapSource={toggleSwapSource}
+            onSwapTargetClick={(index) => completeSwap(selectedDate, index)}
+            adjust={adjust}
+            pushToWatch={pushToWatch}
+          />
+        </>
       )}
     </div>
   )

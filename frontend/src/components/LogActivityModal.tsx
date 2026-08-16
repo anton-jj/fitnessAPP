@@ -38,8 +38,8 @@ export default function LogActivityModal({ open, onClose }: Props) {
     }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['activities'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
-      queryClient.invalidateQueries({ queryKey: ['weekly'] })
+      queryClient.invalidateQueries({ queryKey: ['fitness'] })
+      queryClient.invalidateQueries({ queryKey: ['calendar'] })
       setName('')
       setDistance('')
       setNotes('')

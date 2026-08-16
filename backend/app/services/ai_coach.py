@@ -978,6 +978,24 @@ async def _claude_generate(system_prompt: str, user_prompt: str,
             body["temperature"] = 1
             body["thinking"] = {"type": "adaptive"}
             body["output_config"] = {"effort": "high" if tier == "heavy" else "low"}
+        if settings.claude_skill_id:
+            # Betas are signaled via the header (not a JSON `betas` field) on
+            # the raw Messages API — the Python SDK's `betas=[...]` kwarg is
+            # just sugar for this same header. code_execution runs server-side
+            # within one request/response; no client-side tool loop needed for
+            # the normal case. Not handled: stop_reason "pause_turn" for a
+            # very long-running execution, which would need the container id
+            # carried into a follow-up request — this codebase only makes
+            # single-shot calls today.
+            headers["anthropic-beta"] = "code-execution-2025-08-25,skills-2025-10-02"
+            body["container"] = {
+                "skills": [{
+                    "type": "custom",
+                    "skill_id": settings.claude_skill_id,
+                    "version": settings.claude_skill_version,
+                }],
+            }
+            body["tools"] = [{"type": "code_execution_20250825", "name": "code_execution"}]
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers=headers,
@@ -996,11 +1014,15 @@ async def _claude_generate(system_prompt: str, user_prompt: str,
         stop_reason = resp_data.get("stop_reason")
         if stop_reason == "max_tokens":
             log.warning(f"Claude response truncated (hit max_tokens={max_tokens})")
+        # The last text block, not the first: with no tools there is only
+        # one, so this is a no-op change for the common case — but with the
+        # code_execution tool active the model can emit intermediate text
+        # around tool calls, and the final JSON answer is whichever text
+        # block comes last, not first.
         text = ""
         for block in resp_data.get("content", []):
             if block.get("type") == "text":
                 text = block["text"]
-                break
         if not text:
             _last_error = "No text block in Claude response"
             log.error(f"No text block found. Content types: {[b.get('type') for b in resp_data.get('content', [])]}")

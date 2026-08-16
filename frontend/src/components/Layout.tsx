@@ -2,19 +2,17 @@ import { useState } from 'react'
 import { Outlet, NavLink } from 'react-router-dom'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
-  LayoutDashboard, Activity, CalendarDays, Heart,
+  Activity, CalendarDays, Heart,
   Brain, Bike, Settings as SettingsIcon, Zap,
-  ClipboardList, Plus, ListChecks, Lock,
+  Plus, Lock, TrendingUp,
 } from 'lucide-react'
 import { api } from '../api/client'
 import LogActivityModal from './LogActivityModal'
 
 const nav = [
-  { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
-  { to: '/week', icon: ClipboardList, label: 'Week' },
-  { to: '/plan', icon: ListChecks, label: 'Plan' },
+  { to: '/', icon: CalendarDays, label: 'Calendar' },
+  { to: '/fitness', icon: TrendingUp, label: 'Fitness' },
   { to: '/activities', icon: Activity, label: 'Activities' },
-  { to: '/calendar', icon: CalendarDays, label: 'Calendar' },
   { to: '/wellness', icon: Heart, label: 'Wellness' },
   { to: '/coach', icon: Brain, label: 'AI Coach' },
   { to: '/trainer', icon: Bike, label: 'Trainer' },

@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from ..database import get_db
-from ..models import Activity, TrainingPlan
+from ..models import Activity
 from ..schemas import ActivityOut, ManualActivityCreate
 from datetime import datetime, timedelta
 import csv
@@ -87,55 +87,9 @@ async def calendar_data(
     by_day: dict[str, list] = {}
     for a in activities:
         day = a.start_time.strftime("%Y-%m-%d")
-        if day not in by_day:
-            by_day[day] = []
-        by_day[day].append(ActivityOut.model_validate(a).model_dump())
-
-    plan_result = await db.execute(
-        select(TrainingPlan).where(
-            TrainingPlan.status.in_(["active", "upcoming"])
-        )
-    )
-    plans = plan_result.scalars().all()
-    for plan in plans:
-        if not plan.plan_data:
-            continue
-        days_list = plan.plan_data.get("days", [])
-        weeks_list = plan.plan_data.get("weeks", [])
-        if weeks_list:
-            for week in weeks_list:
-                for day_data in week.get("days", []):
-                    _add_planned_workouts(by_day, day_data, start, end)
-        elif days_list:
-            for day_data in days_list:
-                _add_planned_workouts(by_day, day_data, start, end)
+        by_day.setdefault(day, []).append(ActivityOut.model_validate(a).model_dump())
 
     return by_day
-
-
-def _add_planned_workouts(by_day: dict, day_data: dict, start: datetime, end: datetime):
-    date_str = day_data.get("date")
-    if not date_str:
-        return
-    try:
-        dt = datetime.strptime(date_str, "%Y-%m-%d")
-    except (ValueError, TypeError):
-        return
-    if dt < start or dt >= end:
-        return
-    for w in day_data.get("workouts", []):
-        if w.get("workout_type") == "rest":
-            continue
-        by_day.setdefault(date_str, []).append({
-            "id": None,
-            "planned": True,
-            "name": w.get("name", w.get("workout_type", "Workout")),
-            "sport_type": w.get("sport", "cycling"),
-            "duration_minutes": w.get("duration_minutes"),
-            "workout_type": w.get("workout_type"),
-            "tss_estimate": w.get("tss_estimate"),
-            "priority": w.get("priority"),
-        })
 
 
 @router.get("/export/{fmt}")

@@ -121,12 +121,6 @@ class ManualActivityCreate(BaseModel):
     start_time: Optional[datetime] = None
 
 
-class WeeklyGoal(BaseModel):
-    week: str  # ISO week "2026-W31"
-    hours_target: Optional[float] = None
-    quality_sessions: list[dict] = []  # [{sport, label, done}]
-
-
 class TrainerRideData(BaseModel):
     duration_seconds: int
     power_data: list[int]  # power samples (1 per second)
@@ -167,5 +161,7 @@ class SettingsUpdate(BaseModel):
     ollama_model_heavy: Optional[str] = None
     claude_model_light: Optional[str] = None
     claude_model_heavy: Optional[str] = None
+    claude_skill_id: Optional[str] = None
+    claude_skill_version: Optional[str] = None
     openai_model_light: Optional[str] = None
     openai_model_heavy: Optional[str] = None

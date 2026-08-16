@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     openai_model_heavy: str = "gpt-4o"
     anthropic_api_key: str = ""
     openai_api_key: str = ""
+    # A custom Claude skill (created in the Anthropic console) to attach to
+    # every Claude call via the code-execution + skills betas. Unset means
+    # skip the betas entirely — this is Claude-only and off by default so it
+    # never touches the ollama/openai code paths or existing behavior.
+    claude_skill_id: str = ""
+    claude_skill_version: str = "latest"
 
     sync_interval: int = 15
     ftp: int = 200

@@ -25,6 +25,8 @@ async def get_settings(db: AsyncSession = Depends(get_db)):
         "ollama_model_heavy": db_settings.get("ollama_model_heavy", settings.ollama_model_heavy),
         "claude_model_light": db_settings.get("claude_model_light", settings.claude_model_light),
         "claude_model_heavy": db_settings.get("claude_model_heavy", settings.claude_model_heavy),
+        "claude_skill_id": db_settings.get("claude_skill_id", settings.claude_skill_id),
+        "claude_skill_version": db_settings.get("claude_skill_version", settings.claude_skill_version),
         "openai_model_light": db_settings.get("openai_model_light", settings.openai_model_light),
         "openai_model_heavy": db_settings.get("openai_model_heavy", settings.openai_model_heavy),
         "strava_client_id": settings.strava_client_id or db_settings.get("strava_client_id", ""),

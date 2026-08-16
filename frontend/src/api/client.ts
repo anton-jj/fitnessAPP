@@ -67,13 +67,6 @@ export const api = {
   logActivity: (data: { sport_type: string; name?: string; duration_minutes: number; distance_km?: number; notes?: string }) =>
     request<any>('/activities', { method: 'POST', body: JSON.stringify(data) }),
 
-  weeklyOverview: (week?: string) => {
-    const q = week ? `?week=${week}` : ''
-    return request<any>(`/weekly${q}`)
-  },
-  updateWeeklyGoal: (data: { week: string; hours_target?: number; quality_sessions: any[] }) =>
-    request<any>('/weekly', { method: 'PUT', body: JSON.stringify(data) }),
-
   saveTrainerRide: (data: any) => request<any>('/trainer/save', { method: 'POST', body: JSON.stringify(data) }),
   exportFit: async (data: any) => {
     const res = await fetch(`${BASE}/trainer/fit`, {

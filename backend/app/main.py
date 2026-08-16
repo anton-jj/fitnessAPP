@@ -11,7 +11,7 @@ from .config import settings
 from .services.sync_manager import run_sync
 from .services.auto_push import push_todays_workouts
 from .services import session_auth
-from .routers import auth, dashboard, activities, wellness, sync, ai_coach, settings_router, weekly, trainer, profile
+from .routers import auth, dashboard, activities, wellness, sync, ai_coach, settings_router, trainer, profile
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -102,7 +102,6 @@ app.include_router(wellness.router)
 app.include_router(sync.router)
 app.include_router(ai_coach.router)
 app.include_router(settings_router.router)
-app.include_router(weekly.router)
 app.include_router(trainer.router)
 app.include_router(profile.router)
 
