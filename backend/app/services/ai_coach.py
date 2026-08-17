@@ -153,8 +153,14 @@ Output a JSON object:
 Return ONLY the JSON object."""
 
 
-# The philosophy is shared by both coaching calls below.
-TRAINING_PHILOSOPHY = """## TRAINING PHILOSOPHY
+# Split in two: the SCIENCE section (volume/intensity balance, frequency,
+# sport cost, event specificity, progression) is exactly the kind of
+# reference material a training-science skill should own, so it's dropped
+# entirely when a skill is attached (see SKILL_POINTER below) rather than
+# duplicated in Python. The CONTRACT section is Pulse-specific — it names
+# envelope fields (archetype tags, quality_sport_priority) no generic skill
+# would know about — so it applies unconditionally either way.
+TRAINING_PHILOSOPHY_SCIENCE = """## TRAINING PHILOSOPHY
 
 Training distribution should emerge from the athlete's constraints, NOT from a predefined
 methodology (not "Norwegian", not "polarized", not "pyramidal"). Ask: "Given this athlete's
@@ -199,6 +205,13 @@ As race distance increases:
 - Marathon: long runs become essential
 - Ironman: large aerobic volume cannot be replaced with intervals
 
+### Progression Rules
+- Only increase one major variable at a time (volume, frequency, intensity, duration)
+- Include recovery weeks every 3-5 weeks (20-40% volume reduction)
+- Never increase multiple variables simultaneously"""
+
+TRAINING_ENVELOPE_CONTRACT = """## SESSION ARCHETYPES & SAFETY (Pulse data contract — always follow)
+
 ### Session Archetypes
 Each discipline should normally contain at most one session of each archetype per week:
 - one long session
@@ -219,11 +232,6 @@ When multiple designs satisfy the required weekly volume, prefer the one that:
 2. Places most additional endurance volume into the designated long session.
 3. Maintains realistic recovery between key workouts.
 
-### Progression Rules
-- Only increase one major variable at a time (volume, frequency, intensity, duration)
-- Include recovery weeks every 3-5 weeks (20-40% volume reduction)
-- Never increase multiple variables simultaneously
-
 ### Safety Constraints (MUST follow)
 - Never prescribe excessive intensity for the available volume
 - Never increase running load too rapidly
@@ -239,10 +247,10 @@ When multiple designs satisfy the required weekly volume, prefer the one that:
 # "norwegian" — plan_builder has already applied the hard guards (minimum
 # weekly hours, no cutback weeks, no stacking on an active ramp) and
 # restructured up to two quality days into AM sub-threshold / PM shakeout
-# pairs, tagging the AM session's workout_type "sub_threshold". Unlike
-# TRAINING_PHILOSOPHY above, this block names the method explicitly — the
-# athlete chose it and wants it coached as such, not described generically.
-NORWEGIAN_TRAINING_PHILOSOPHY = """## TRAINING PHILOSOPHY: NORWEGIAN DOUBLE-THRESHOLD METHOD
+# pairs, tagging the AM session's workout_type "sub_threshold". Same
+# science/contract split as above: the method's rationale is skill material,
+# the envelope mechanics (workout_type tagging, AM/PM pairing) are not.
+NORWEGIAN_TRAINING_PHILOSOPHY_SCIENCE = """## TRAINING PHILOSOPHY: NORWEGIAN DOUBLE-THRESHOLD METHOD
 
 This athlete has opted into Norwegian-style double-threshold training. Unlike the
 generic methodology-agnostic approach, name the method explicitly and coach to it —
@@ -256,9 +264,6 @@ the athlete chose this style and expects it, not a euphemism for it.
   the athlete stays just under threshold rather than recovering enough to push
   over it — the point is high-quality time near threshold with low accumulated
   fatigue, not maximal single efforts.
-- The AM session's `workout_type` is already "sub_threshold" in the envelope —
-  write intervals that hold that effort steady and controlled, not building to a
-  crescendo like a normal threshold set.
 - The PM shakeout is genuinely easy (recovery pace/power) — its only job is
   circulation and technique, never intensity. Keep it short and low-key.
 - The other quality/easy/long sessions in the week follow the same volume,
@@ -284,15 +289,20 @@ ability to substitute volume with intensity decreases — double-threshold days
 sharpen threshold-adjacent fitness, they do not substitute for race-specific
 long-session volume.
 
-### Session Archetypes
-Every session in the envelope is tagged with its archetype (quality/easy/long).
-Respect those tags, including the AM/PM pairing on double-threshold days.
-
 ### Progression Rules
 - Only increase one major variable at a time (volume, frequency, intensity, duration)
 - Include recovery weeks every 3-5 weeks (20-40% volume reduction) — double-threshold
   days are never scheduled in a recovery or taper week
-- Never increase multiple variables simultaneously
+- Never increase multiple variables simultaneously"""
+
+NORWEGIAN_ENVELOPE_CONTRACT = """## SESSION ARCHETYPES & SAFETY (Pulse data contract — always follow)
+
+### Envelope Mechanics
+- The AM session's `workout_type` is already "sub_threshold" in the envelope —
+  write intervals that hold that effort steady and controlled, not building to a
+  crescendo like a normal threshold set.
+- Every session in the envelope is tagged with its archetype (quality/easy/long).
+  Respect those tags, including the AM/PM pairing on double-threshold days.
 
 ### Safety Constraints (MUST follow)
 - Never turn the PM shakeout into a second hard session
@@ -302,8 +312,60 @@ Respect those tags, including the AM/PM pairing on double-threshold days.
 - Never overemphasize one discipline without event-specific justification"""
 
 
-def _philosophy_block(training_style: str) -> str:
-    return NORWEGIAN_TRAINING_PHILOSOPHY if training_style == "norwegian" else TRAINING_PHILOSOPHY
+# Appended in place of the SCIENCE half above when a Claude skill is attached
+# — the skill is a training-science reference bundle (see SKILL_USAGE_NOTE),
+# so restating that same reasoning as static Python text would just be two
+# sources of truth drifting apart. This tells the model to treat the skill as
+# the authority for exactly the judgment calls the SCIENCE text used to make
+# for it: volume/intensity balance, frequency progression, sport cost, event
+# specificity, periodization.
+SKILL_POINTER = """## TRAINING PHILOSOPHY
+
+Training philosophy — volume/intensity balance, frequency progression,
+sport-specific cost, event specificity, and periodization — is not restated
+here. Use code_execution to open and read the attached training-science
+skill's reference material and apply it as the authority for every judgment
+call of that kind. The athlete's stated preferences and history (below) are
+the inputs; the skill is where the reasoning about what to do with them
+lives."""
+
+NORWEGIAN_SKILL_POINTER = """## TRAINING PHILOSOPHY: NORWEGIAN DOUBLE-THRESHOLD METHOD
+
+This athlete has opted into Norwegian-style double-threshold training — name
+the method explicitly and coach to it, the athlete chose this style and
+expects it. The training-science reasoning behind the method (why short rest
+between reps, target RPE, how doubles fit the athlete's broader volume/
+intensity balance) is not restated here — use code_execution to open and read
+the attached skill's reference material and apply it as the authority."""
+
+
+def _philosophy_block(training_style: str, use_skill: bool = False) -> str:
+    norwegian = training_style == "norwegian"
+    contract = NORWEGIAN_ENVELOPE_CONTRACT if norwegian else TRAINING_ENVELOPE_CONTRACT
+    if use_skill:
+        pointer = NORWEGIAN_SKILL_POINTER if norwegian else SKILL_POINTER
+        return pointer + "\n\n" + contract
+    science = NORWEGIAN_TRAINING_PHILOSOPHY_SCIENCE if norwegian else TRAINING_PHILOSOPHY_SCIENCE
+    return science + "\n\n" + contract
+
+
+# Appended to the system prompt only when a Claude skill is attached (see
+# _claude_generate) — the skill's contents are a custom training-science
+# reference bundle, not something the model reads automatically just because
+# it's attached. Without an explicit instruction like this, the model has no
+# reason to reach for code_execution on a JSON-authoring task and the skill
+# sits unused.
+SKILL_USAGE_NOTE = """
+
+## REFERENCE SKILL
+
+You have a code_execution tool with a custom skill attached containing
+training-science reference material (periodization guidelines, zone models,
+pacing/TSS formulas, session-design rules). Before finalizing your answer,
+use code_execution to open and read the skill's relevant reference files and
+let them inform your decisions — cross-check your session design, zone
+targets and progression choices against it rather than relying on your own
+recall. Do not skip this step or answer without having consulted it."""
 
 
 STRATEGY_PROMPT_HEAD = """You are an expert endurance sports coach setting the direction for a training block.
@@ -340,8 +402,8 @@ quality session that week. Vary the workout types across weeks so each energy sy
 is developed, and progress them deliberately rather than at random. Return ONLY JSON."""
 
 
-def _strategy_prompt(training_style: str = "standard") -> str:
-    return STRATEGY_PROMPT_HEAD + _philosophy_block(training_style) + STRATEGY_PROMPT_TAIL
+def _strategy_prompt(training_style: str = "standard", use_skill: bool = False) -> str:
+    return STRATEGY_PROMPT_HEAD + _philosophy_block(training_style, use_skill) + STRATEGY_PROMPT_TAIL
 
 
 # Kept as a module-level constant too — some tests/tools may still import it
@@ -401,8 +463,8 @@ Return a JSON object and nothing else:
 Do not include rest days. Return ONLY JSON."""
 
 
-def _week_prompt(training_style: str = "standard") -> str:
-    return WEEK_PROMPT_HEAD + _philosophy_block(training_style) + WEEK_PROMPT_TAIL
+def _week_prompt(training_style: str = "standard", use_skill: bool = False) -> str:
+    return WEEK_PROMPT_HEAD + _philosophy_block(training_style, use_skill) + WEEK_PROMPT_TAIL
 
 
 # Kept as a module-level constant too, for the same reason as STRATEGY_PROMPT.
@@ -453,10 +515,14 @@ async def generate_structured_plan(profile: dict, ftp: int,
                       first_week_from=first_week_from)
 
     # Norwegian style is named and coached explicitly rather than through the
-    # methodology-agnostic philosophy — see NORWEGIAN_TRAINING_PHILOSOPHY.
+    # methodology-agnostic philosophy — see NORWEGIAN_TRAINING_PHILOSOPHY_SCIENCE.
+    # use_skill only applies to the claude provider — ollama/openai never get
+    # the skill wired in (see _claude_generate), so they keep the full
+    # science text as their only source of that judgment.
     training_style = profile.get("training_style", "standard")
-    strategy_prompt = _strategy_prompt(training_style)
-    week_prompt = _week_prompt(training_style)
+    use_skill = settings.ai_provider == "claude" and bool(settings.claude_skill_id)
+    strategy_prompt = _strategy_prompt(training_style, use_skill)
+    week_prompt = _week_prompt(training_style, use_skill)
 
     strategy = await _generate(
         strategy_prompt,
@@ -610,7 +676,15 @@ def _build_athlete_context(profile: dict, ftp: int,
         f"Goal: {profile.get('goal', 'general_fitness')}",
         f"Sports: {', '.join(profile.get('sports', ['cycling']))}",
         f"Weekly hours: {profile.get('weekly_hours', 8)}h",
+        f"Training style preference: {profile.get('training_style', 'standard')}",
     ]
+
+    if profile.get("quality_sport_priority"):
+        lines.append(
+            "Quality-session priority (athlete's own ranking, highest first): "
+            + " > ".join(profile["quality_sport_priority"])
+            + " — the top sport may carry a second quality session in the same week."
+        )
 
     history = profile.get("observed_history")
     if history:
@@ -962,6 +1036,14 @@ async def _claude_generate(system_prompt: str, user_prompt: str,
     timeout = 300 if tier == "heavy" else 90
     max_tokens = 32000 if tier == "heavy" else 4000
     is_thinking_model = "fable" in model or "opus" in model
+    # Attaching a skill only makes it available — the model won't reach for
+    # code_execution on a pure JSON-authoring task without a reason to, so a
+    # skill_id with no nudge sits attached and unused. The main plan-generation
+    # prompts (strategy/week) already embed this via SKILL_POINTER, since they
+    # need to say what the skill replaces; this covers the other callers
+    # (ad-hoc session, plan adjustment) that don't build a philosophy block.
+    if settings.claude_skill_id and "code_execution" not in system_prompt:
+        system_prompt = system_prompt + SKILL_USAGE_NOTE
     async with httpx.AsyncClient(timeout=timeout) as client:
         body: dict = {
             "model": model,
@@ -1014,6 +1096,14 @@ async def _claude_generate(system_prompt: str, user_prompt: str,
         stop_reason = resp_data.get("stop_reason")
         if stop_reason == "max_tokens":
             log.warning(f"Claude response truncated (hit max_tokens={max_tokens})")
+        if settings.claude_skill_id:
+            block_types = [b.get("type") for b in resp_data.get("content", [])]
+            skill_used = any("code_execution" in t for t in block_types if t)
+            log.info(
+                f"Skill call: skill_id={settings.claude_skill_id} "
+                f"container={resp_data.get('container')} "
+                f"content_blocks={block_types} invoked={skill_used}"
+            )
         # The last text block, not the first: with no tools there is only
         # one, so this is a no-op change for the common case — but with the
         # code_execution tool active the model can emit intermediate text
