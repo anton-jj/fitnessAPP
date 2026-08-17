@@ -7,6 +7,7 @@ import {
   ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip,
 } from 'recharts'
 import { format, parseISO } from 'date-fns'
+import { METRIC_COLORS } from '../theme'
 
 export default function Wellness() {
   const [days, setDays] = useState(30)
@@ -70,10 +71,12 @@ export default function Wellness() {
         />
       </div>
 
-      <WellnessChart data={chartData} dataKey="hrv" label="HRV" color="#9b8fa8" unit="ms" />
-      <WellnessChart data={chartData} dataKey="resting_hr" label="Resting Heart Rate" color="#c07a72" unit="bpm" />
-      <WellnessChart data={chartData} dataKey="sleep" label="Sleep Duration" color="#7d95ab" unit="hours" />
-      <WellnessChart data={chartData} dataKey="weight" label="Weight" color="#8a97a3" unit="kg" />
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <WellnessChart data={chartData} dataKey="hrv" label="HRV" color={METRIC_COLORS.hrv} unit="ms" />
+        <WellnessChart data={chartData} dataKey="resting_hr" label="Resting Heart Rate" color={METRIC_COLORS.heartRate} unit="bpm" />
+        <WellnessChart data={chartData} dataKey="sleep" label="Sleep Duration" color={METRIC_COLORS.sleep} unit="hours" />
+        <WellnessChart data={chartData} dataKey="weight" label="Weight" color={METRIC_COLORS.weight} unit="kg" />
+      </div>
     </div>
   )
 }

@@ -5,6 +5,7 @@ from sqlalchemy import select
 from ..models import Credential
 from ..config import settings
 from .fit_workout import generate_workout_fit, workout_filename
+from .plan_builder import format_pace, format_swim_pace
 import logging
 import base64
 
@@ -151,52 +152,139 @@ SPORT_TO_INTERVALS = {
 }
 
 
-def _describe_steps(workout: dict) -> str:
-    """Readable session text for the calendar entry."""
+def _dsl_duration(seconds: int) -> str:
+    minutes, secs = divmod(int(seconds or 0), 60)
+    if minutes and secs:
+        return f"{minutes}m{secs}s"
+    if minutes:
+        return f"{minutes}m"
+    return f"{secs}s"
+
+
+def _dsl_target(step: dict, sport: str) -> str:
+    """intervals.icu's own workout syntax target token for one step.
+
+    Cycling: "90%" (of FTP), optionally "+90rpm" for cadence. Running/
+    swimming: a pace token like "5:00/km Pace" or "1:45/100m Pace" — their
+    parser accepts pace natively, it's not FTP-percent-only.
+    """
+    power = step.get("power")
+    if sport == "cycling" and isinstance(power, (int, float)):
+        token = f"{power * 100:.0f}%"
+        if step.get("cadence"):
+            token += f" {int(step['cadence'])}rpm"
+        return token
+    pace = step.get("pace")
+    if isinstance(pace, (int, float)) and pace > 0:
+        formatted = format_swim_pace(pace) if sport == "swimming" else format_pace(pace)
+        return f"{formatted} Pace"
+    return ""
+
+
+_DSL_SECTION_LABEL = {
+    "warmup": "Warmup",
+    "cooldown": "Cooldown",
+    "rest": "Recovery",
+    "recovery": "Recovery",
+}
+
+
+def _dsl_description(workout: dict) -> str:
+    """Structured description in intervals.icu's own plain-text workout
+    syntax (section header, blank line, dash-prefixed steps) — this is what
+    intervals.icu actually parses into real power/pace targets on its own
+    calendar and analysis pages. A FIT attachment alone doesn't get this:
+    intervals.icu's FIT re-import path has documented quirks (dropped rest,
+    unexpected paces on swim files) that the native syntax sidesteps.
+    Cycling/running/swimming only — strength has no equivalent, see
+    _strength_description.
+    """
+    sport = workout.get("sport", "cycling")
+    sections = []
+    for step in workout.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        seconds = step.get("duration")
+        if not seconds:
+            continue
+        repeat = step.get("repeat") or 1
+        label = _DSL_SECTION_LABEL.get((step.get("type") or "").lower(), "Main Set")
+        header = f"{label} {repeat}x" if repeat > 1 else label
+
+        lines = [f"- {_dsl_duration(seconds)} {_dsl_target(step, sport)}".rstrip()]
+        rest = step.get("rest")
+        if isinstance(rest, dict) and rest.get("duration"):
+            lines.append(f"- {_dsl_duration(rest['duration'])} {_dsl_target(rest, sport)}".rstrip())
+
+        sections.append(header + "\n" + "\n".join(lines))
+
+    return "\n\n".join(sections)
+
+
+def _strength_description(workout: dict) -> str:
+    """Readable exercise/sets/reps/rest text for a gym session.
+
+    intervals.icu has no structured format for strength — sets, reps and
+    rest aren't representable in either the workout syntax or a FIT file it
+    will parse (confirmed platform limitation, not a Pulse gap: it shows
+    strength FIT steps as a plain note at best). A clean text list is the
+    most it can faithfully display.
+    """
+    parts = []
+    if workout.get("description"):
+        parts.append(workout["description"])
+
     lines = []
     for step in workout.get("steps") or []:
         if not isinstance(step, dict):
             continue
-        minutes = round((step.get("duration") or 0) / 60)
-        repeat = step.get("repeat") or 1
-        label = step.get("notes") or step.get("type", "step")
-        if repeat > 1:
-            rest = step.get("rest") or {}
-            rest_min = round((rest.get("duration") or 0) / 60)
-            lines.append(f"{repeat}x {minutes}min — {label}"
-                         + (f" ({rest_min}min recovery)" if rest_min else ""))
-        else:
-            lines.append(f"{minutes}min — {label}")
+        name = step.get("exercise") or step.get("type", "Exercise")
+        reps = step.get("reps")
+        sets = step.get("sets") or step.get("repeat") or 1
+        rest = step.get("rest") or {}
+        rest_sec = rest.get("duration")
 
-    parts = []
-    if workout.get("description"):
-        parts.append(workout["description"])
-    if workout.get("target_zone"):
-        parts.append(f"Target: {workout['target_zone']}")
+        line = f"- {name}"
+        if reps:
+            line += f": {sets}x{reps}" if sets and sets > 1 else f": {reps} reps"
+        if rest_sec:
+            line += f", {int(rest_sec)}s rest"
+        if step.get("notes"):
+            line += f" — {step['notes']}"
+        lines.append(line)
     if lines:
         parts.append("\n".join(lines))
+
     if workout.get("coach_notes"):
         parts.append(f"Coach: {workout['coach_notes']}")
     return "\n\n".join(parts)
 
 
 def _event_payload(workout: dict, date: str, ftp: int) -> dict:
-    """One intervals.icu calendar event, with the workout attached as FIT.
+    """One intervals.icu calendar event.
 
     Planned sessions are calendar *events* with category WORKOUT — the
     /workouts endpoint is the reusable workout library and never reaches the
-    athlete's calendar or their watch.
+    athlete's calendar or their watch. Endurance sports get a description in
+    intervals.icu's own structured workout syntax (parsed into real targets
+    on their side) plus a FIT attachment for device forwarding. Strength
+    gets neither structure intervals.icu can use — see _strength_description
+    — so it's plain text and no FIT attachment.
     """
     sport = workout.get("sport", "cycling")
     duration = int(workout.get("duration_minutes") or 0) * 60
     name = workout.get("name", "Pulse Workout")
+    is_strength = sport == "strength"
 
     payload = {
         "category": "WORKOUT",
         "start_date_local": f"{date}T00:00:00",
         "type": SPORT_TO_INTERVALS.get(sport, "Ride"),
         "name": name,
-        "description": _describe_steps(workout),
+        "description": (
+            _strength_description(workout) if is_strength
+            else (_dsl_description(workout) or workout.get("description", ""))
+        ),
         # Stable id so re-pushing the same session updates it instead of
         # stacking duplicates on the calendar.
         "external_id": f"pulse-{date}-{sport}-{abs(hash(name)) % 100000}",
@@ -204,10 +292,7 @@ def _event_payload(workout: dict, date: str, ftp: int) -> dict:
     if duration:
         payload["moving_time"] = duration
 
-    if workout.get("steps"):
-        # intervals.icu reports "Unhandled duration_type: REPS" and silently
-        # drops those steps, so the pushed copy expresses sets as time. The
-        # downloadable file still uses reps, which watches do understand.
+    if workout.get("steps") and not is_strength:
         fit = generate_workout_fit(workout, ftp=ftp, rep_steps=False)
         payload["filename"] = workout_filename(workout, date)
         payload["file_contents_base64"] = base64.b64encode(fit).decode()

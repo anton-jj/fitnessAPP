@@ -63,11 +63,16 @@ export default function Settings() {
   })
 
   return (
-    <div className="space-y-6 max-w-2xl">
+    <div className="space-y-6">
       <h1 className="text-xl font-bold flex items-center gap-2">
         <SettingsIcon className="w-5 h-5" /> Settings
       </h1>
 
+      {/* Two columns at lg+ so sections use the available width instead of
+         leaving the right half of a desktop viewport empty; each section
+         stays narrow enough internally that form fields don't stretch
+         awkwardly wide. Grid auto-flow pairs them row-major (1+2, 3+4...). */}
+      <div className="space-y-6 lg:space-y-0 lg:grid lg:grid-cols-2 lg:gap-6 lg:items-start">
       {/* Connections */}
       <Section title="Connections" icon={<Link className="w-4 h-4" />}>
         <div className="space-y-4">
@@ -343,6 +348,7 @@ export default function Settings() {
       <Section title="AI Usage" icon={<Database className="w-4 h-4" />}>
         <TokenUsageDisplay />
       </Section>
+      </div>
 
       <button
         onClick={() => updateSettings.mutate({

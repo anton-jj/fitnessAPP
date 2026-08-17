@@ -2,16 +2,7 @@ import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, Legend,
 } from 'recharts'
 import { format, parseISO } from 'date-fns'
-
-const SPORT_COLORS: Record<string, string> = {
-  cycling: '#7d95ab',
-  running: '#8faa7d',
-  swimming: '#74a3a8',
-  strength: '#c2a15c',
-  hiking: '#9b8fa8',
-  xcski: '#b58fa8',
-  other: '#9b8fa8',
-}
+import { SPORT_COLORS } from '../theme'
 
 interface Props {
   data: any[]

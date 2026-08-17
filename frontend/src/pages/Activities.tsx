@@ -55,7 +55,7 @@ export default function Activities() {
           No activities found.
         </div>
       ) : (
-        <div className="space-y-2">
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
           {activities.map((a: any) => (
             <ActivityCard key={a.id} activity={a} />
           ))}

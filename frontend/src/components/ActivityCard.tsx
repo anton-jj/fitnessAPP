@@ -57,28 +57,28 @@ export default function ActivityCard({ activity, compact }: Props) {
           {icon}
         </div>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center justify-between">
-            <h3 className="font-medium text-sm truncate">{activity.name || 'Activity'}</h3>
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="font-medium text-sm truncate min-w-0">{activity.name || 'Activity'}</h3>
             {activity.start_time && (
               <span className="text-xs text-slate-500 ml-2 whitespace-nowrap">
                 {format(new Date(activity.start_time), compact ? 'MMM d' : 'EEE, MMM d')}
               </span>
             )}
           </div>
-          <div className="flex gap-4 mt-1.5 text-xs text-slate-400">
+          <div className="flex flex-wrap gap-x-4 gap-y-0.5 mt-1.5 text-xs text-slate-400">
             {activity.moving_time && (
-              <span>{formatDuration(activity.moving_time)}</span>
+              <span className="whitespace-nowrap">{formatDuration(activity.moving_time)}</span>
             )}
             {activity.distance > 0 && (
-              <span>{formatDistance(activity.distance)}</span>
+              <span className="whitespace-nowrap">{formatDistance(activity.distance)}</span>
             )}
-            {activity.avg_hr > 0 && <span>{Math.round(activity.avg_hr)} bpm</span>}
-            {activity.avg_power > 0 && <span>{Math.round(activity.avg_power)} W</span>}
+            {activity.avg_hr > 0 && <span className="whitespace-nowrap">{Math.round(activity.avg_hr)} bpm</span>}
+            {activity.avg_power > 0 && <span className="whitespace-nowrap">{Math.round(activity.avg_power)} W</span>}
             {activity.avg_pace > 0 && sport === 'running' && (
-              <span>{formatPace(activity.avg_pace)}</span>
+              <span className="whitespace-nowrap">{formatPace(activity.avg_pace)}</span>
             )}
             {activity.tss > 0 && (
-              <span className="text-accent">{Math.round(activity.tss)} TSS</span>
+              <span className="text-accent whitespace-nowrap">{Math.round(activity.tss)} TSS</span>
             )}
           </div>
           {!compact && activity.source && (

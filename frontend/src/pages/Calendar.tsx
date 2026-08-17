@@ -267,65 +267,75 @@ export default function Calendar() {
             />
           )}
 
-          <div className="flex items-center justify-between">
-            <span className="text-sm font-medium">{format(currentMonth, 'MMMM yyyy')}</span>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setCurrentMonth(subMonths(currentMonth, 1))}
-                className="p-1.5 rounded-lg bg-bg-secondary hover:bg-bg-hover transition-colors"
-              >
-                <ChevronLeft className="w-4 h-4" />
-              </button>
-              <button
-                onClick={() => setCurrentMonth(addMonths(currentMonth, 1))}
-                className="p-1.5 rounded-lg bg-bg-secondary hover:bg-bg-hover transition-colors"
-              >
-                <ChevronRight className="w-4 h-4" />
-              </button>
+          {/* Below lg, the day panel stacks under the grid (works fine at
+             mobile width); at lg+ there's room to run it as a side panel
+             next to the grid, TrainingPeaks-style, instead of a long single
+             column that makes the day's detail a full scroll away. */}
+          <div className="lg:flex lg:items-start lg:gap-4">
+            <div className="lg:flex-1 lg:min-w-0 space-y-4">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium">{format(currentMonth, 'MMMM yyyy')}</span>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setCurrentMonth(subMonths(currentMonth, 1))}
+                    className="p-1.5 rounded-lg bg-bg-secondary hover:bg-bg-hover transition-colors"
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                  </button>
+                  <button
+                    onClick={() => setCurrentMonth(addMonths(currentMonth, 1))}
+                    className="p-1.5 rounded-lg bg-bg-secondary hover:bg-bg-hover transition-colors"
+                  >
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              {advice && (
+                <div className="flex items-start gap-2 bg-accent/10 border border-accent/20 rounded-xl p-3 text-sm text-accent">
+                  <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                  <span>{advice}</span>
+                </div>
+              )}
+
+              {calendarLoading ? (
+                <div className="flex items-center justify-center h-32 text-slate-500">Loading calendar...</div>
+              ) : (
+                <MonthGrid
+                  currentMonth={currentMonth}
+                  calendarData={calendarData}
+                  plannedByDate={plannedByDate}
+                  selectedDate={selectedDate}
+                  onSelectDate={setSelectedDate}
+                  swapSource={swapSource}
+                  onCompleteSwap={completeSwap}
+                  onDropWorkout={handleDropWorkout}
+                />
+              )}
+
+              {moveWorkout.isPending && (
+                <p className="text-xs text-slate-500 text-center">Moving workout...</p>
+              )}
+              {moveWorkout.isError && (
+                <p className="text-xs text-danger text-center">Failed to move workout. Only planned workouts within the same week can be moved.</p>
+              )}
+            </div>
+
+            <div className="mt-4 lg:mt-0 lg:w-[22rem] lg:flex-shrink-0 lg:sticky lg:top-4 lg:self-start">
+              <DayDetailPanel
+                date={selectedDate}
+                displayDate={format(new Date(`${selectedDate}T00:00:00`), 'EEEE, MMM d')}
+                dayInfo={plannedByDate[selectedDate] ?? null}
+                activities={calendarData[selectedDate] || []}
+                swapActive={swapSource != null}
+                swapSourceIndex={swapSource && swapSource.date === selectedDate ? swapSource.index : null}
+                onToggleSwapSource={toggleSwapSource}
+                onSwapTargetClick={(index) => completeSwap(selectedDate, index)}
+                adjust={adjust}
+                pushToWatch={pushToWatch}
+              />
             </div>
           </div>
-
-          {advice && (
-            <div className="flex items-start gap-2 bg-accent/10 border border-accent/20 rounded-xl p-3 text-sm text-accent">
-              <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
-              <span>{advice}</span>
-            </div>
-          )}
-
-          {calendarLoading ? (
-            <div className="flex items-center justify-center h-32 text-slate-500">Loading calendar...</div>
-          ) : (
-            <MonthGrid
-              currentMonth={currentMonth}
-              calendarData={calendarData}
-              plannedByDate={plannedByDate}
-              selectedDate={selectedDate}
-              onSelectDate={setSelectedDate}
-              swapSource={swapSource}
-              onCompleteSwap={completeSwap}
-              onDropWorkout={handleDropWorkout}
-            />
-          )}
-
-          {moveWorkout.isPending && (
-            <p className="text-xs text-slate-500 text-center">Moving workout...</p>
-          )}
-          {moveWorkout.isError && (
-            <p className="text-xs text-danger text-center">Failed to move workout. Only planned workouts within the same week can be moved.</p>
-          )}
-
-          <DayDetailPanel
-            date={selectedDate}
-            displayDate={format(new Date(`${selectedDate}T00:00:00`), 'EEEE, MMM d')}
-            dayInfo={plannedByDate[selectedDate] ?? null}
-            activities={calendarData[selectedDate] || []}
-            swapActive={swapSource != null}
-            swapSourceIndex={swapSource && swapSource.date === selectedDate ? swapSource.index : null}
-            onToggleSwapSource={toggleSwapSource}
-            onSwapTargetClick={(index) => completeSwap(selectedDate, index)}
-            adjust={adjust}
-            pushToWatch={pushToWatch}
-          />
         </>
       )}
     </div>

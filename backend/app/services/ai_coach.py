@@ -431,12 +431,14 @@ Steps are pushed to the athlete's watch, so they must be executable as written.
 - SWIMMING: no power. Set `pace` in SECONDS PER 100M against the athlete's CSS,
   and put the set in `notes` (e.g. "8x100m @ 1:45/100m, 15s rest"). Always
   include a technique/drill block. Never reference FTP or watts for a swim.
-- STRENGTH: no power and NO timed blocks. Each exercise is a step with `reps`
-  (repetitions per set) and `sets`, plus a `rest` step in seconds between sets.
-  Never prescribe an exercise as a duration — "Split Squat, 5 minutes" is not
-  how anyone lifts. Keep the envelope's exercises and set/rep scheme unless you
-  have a reason to change them; you may rewrite names, cues and coach notes.
-  Bias toward heavy-ish low-rep single-leg, posterior chain and trunk work.
+- STRENGTH: no power and NO timed blocks. Each exercise is a step with an
+  `exercise` field (the exercise name, e.g. "Bulgarian Split Squat" — this
+  exact field name, nothing else) plus `reps` (repetitions per set) and
+  `sets`, plus a `rest` step in seconds between sets. Never prescribe an
+  exercise as a duration — "Split Squat, 5 minutes" is not how anyone lifts.
+  Keep the envelope's exercises and set/rep scheme unless you have a reason
+  to change them; you may rewrite names, cues and coach notes. Bias toward
+  heavy-ish low-rep single-leg, posterior chain and trunk work.
 
 ## WHAT TO RETURN
 
@@ -459,6 +461,10 @@ Return a JSON object and nothing else:
     }
   ]
 }
+
+Strength steps use a different shape — `exercise`/`reps`/`sets` instead of
+`duration`/`power`, per-exercise rest instead of an interval `rest` block:
+{"exercise": "Bulgarian Split Squat", "reps": 8, "sets": 3, "rest": {"duration": 90}, "notes": "each leg, control the eccentric"}
 
 Do not include rest days. Return ONLY JSON."""
 

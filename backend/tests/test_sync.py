@@ -15,7 +15,7 @@ from app.services.fit_workout import (
     workout_filename,
 )
 from app.services.ics_feed import _fold, plan_to_ics
-from app.services.intervals import _event_payload, _describe_steps
+from app.services.intervals import _event_payload, _dsl_description, _strength_description
 
 
 def decode(data: bytes) -> list[dict]:
@@ -174,10 +174,42 @@ def test_repushing_the_same_session_keeps_a_stable_id():
     assert first == second
 
 
-def test_description_includes_the_interval_structure():
-    text = _describe_steps(BIKE)
-    assert "3x" in text
-    assert "threshold" in text
+def test_description_uses_intervals_icu_native_workout_syntax():
+    """Structure lives in intervals.icu's own parseable syntax, not prose —
+    that's what it actually parses into real power/pace targets on its side,
+    rather than relying solely on its known-quirky FIT re-import path."""
+    text = _dsl_description(BIKE)
+    assert "Main Set 3x" in text
+    assert "- 12m 100%" in text
+    assert "- 5m 55%" in text  # rest step, back to warmup-equivalent power
+
+
+def test_swim_description_uses_pace_not_ftp_percent():
+    text = _dsl_description(SWIM)
+    assert "Main Set 8x" in text
+    assert "1:40/100m Pace" in text
+    assert "%" not in text
+
+
+def test_strength_gets_no_fit_attachment_and_no_dsl_syntax():
+    """intervals.icu has no structured format for sets/reps/rest — a FIT
+    attachment or the workout syntax would just misrepresent it, so strength
+    pushes plain readable text and skips the attachment entirely."""
+    payload = _event_payload(STRUCTURED_STRENGTH, "2026-08-10", 250)
+    assert "filename" not in payload
+    assert "file_contents_base64" not in payload
+    assert "Bulgarian Split Squat: 3x8" in payload["description"]
+    assert "90s rest" in payload["description"]
+
+
+STRUCTURED_STRENGTH = {
+    "name": "Lower Body Strength", "sport": "strength", "duration_minutes": 30,
+    "description": "Heavy single-leg work.",
+    "steps": [
+        {"exercise": "Bulgarian Split Squat", "reps": 8, "sets": 3,
+         "rest": {"duration": 90}, "notes": "each leg"},
+    ],
+}
 
 
 # --- ICS feed ---

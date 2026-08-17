@@ -128,20 +128,22 @@ export default function PlanHeader({
         </button>
       </div>
 
-      {/* Plan description, volume ramp, capacity feedback */}
-      <div className="space-y-2">
+      {/* Plan description and volume ramp are narrative context, not
+         actionable — plain muted text with no card chrome so they read as
+         secondary instead of competing with the actual plan data below. */}
+      <div className="space-y-1.5">
         {plan.plan.description && (
-          <p className="text-sm text-slate-400 bg-bg-secondary rounded-xl border border-white/5 p-4">
+          <p className="text-xs text-slate-500 leading-relaxed">
             {plan.plan.description}
           </p>
         )}
         {plan.plan.progression_assessment?.peak_hours && (
-          <div className="flex items-start gap-2 text-xs text-slate-500 bg-bg-secondary rounded-xl border border-white/5 px-4 py-2.5">
-            <TrendingUp className="w-3.5 h-3.5 flex-shrink-0 text-accent mt-0.5" />
+          <div className="flex items-start gap-2 text-xs text-slate-600">
+            <TrendingUp className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
             <div>
               <span>
                 Volume ramps{' '}
-                <span className="text-slate-300">
+                <span className="text-slate-500">
                   {plan.plan.progression_assessment.start_hours}h → {plan.plan.progression_assessment.peak_hours}h
                 </span>{' '}
                 per week over {plan.plan.progression_assessment.build_weeks} build weeks
@@ -327,7 +329,7 @@ export default function PlanHeader({
 
       {/* Plan-level info and actions */}
       {plan.plan.progression_notes && (
-        <p className="text-xs text-slate-500 bg-bg-secondary rounded-xl border border-white/5 p-3 italic">
+        <p className="text-xs text-slate-600 italic px-0.5">
           {plan.plan.progression_notes}
         </p>
       )}

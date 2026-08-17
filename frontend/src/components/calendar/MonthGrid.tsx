@@ -74,7 +74,7 @@ export default function MonthGrid({
 
   return (
     <div className="bg-bg-secondary rounded-xl border border-white/5 overflow-hidden">
-      <div className="grid grid-cols-[repeat(7,1fr)_auto] text-xs text-slate-500 border-b border-white/5">
+      <div className="grid grid-cols-[repeat(7,minmax(0,1fr))_auto] text-xs text-slate-500 border-b border-white/5">
         {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map((d) => (
           <div key={d} className="py-2 text-center font-medium">{d}</div>
         ))}
@@ -99,7 +99,7 @@ export default function MonthGrid({
         const hasWeekData = plannedMin > 0 || doneMin > 0
 
         return (
-        <div key={week[0].toISOString()} className="grid grid-cols-[repeat(7,1fr)_auto]">
+        <div key={week[0].toISOString()} className="grid grid-cols-[repeat(7,minmax(0,1fr))_auto]">
         {week.map((day) => {
           const dateKey = format(day, 'yyyy-MM-dd')
           const realActivities: any[] = calendarData[dateKey] || []
@@ -130,7 +130,7 @@ export default function MonthGrid({
                   onSelectDate(dateKey)
                 }
               }}
-              className={`min-h-[80px] md:min-h-[100px] p-1.5 border-b border-r border-white/5 transition-colors cursor-pointer ${
+              className={`min-h-[80px] md:min-h-[100px] min-w-0 p-1.5 border-b border-r border-white/5 transition-colors cursor-pointer overflow-hidden ${
                 !inMonth ? 'opacity-30' : ''
               } ${today ? 'bg-accent/5' : ''} ${
                 isSelected ? 'ring-1 ring-inset ring-accent/40' : ''
@@ -158,7 +158,7 @@ export default function MonthGrid({
                         SPORT_DOT_CLASS[a.sport_type] || SPORT_DOT_FALLBACK
                       }`}
                     />
-                    <span className="hidden md:inline truncate ml-0.5">{a.name || a.sport_type}</span>
+                    <span className="hidden md:inline truncate min-w-0 ml-0.5">{a.name || a.sport_type}</span>
                     <span className="md:hidden ml-0.5">{a.sport_type?.slice(0, 3)}</span>
                   </div>
                 ))}
@@ -176,7 +176,7 @@ export default function MonthGrid({
                     }`}
                   >
                     <GripVertical className="w-2.5 h-2.5 opacity-40 flex-shrink-0" />
-                    <span className="hidden md:inline truncate ml-0.5">{w.name || w.sport}</span>
+                    <span className="hidden md:inline truncate min-w-0 ml-0.5">{w.name || w.sport}</span>
                     <span className="md:hidden ml-0.5">{w.sport?.slice(0, 3)}</span>
                   </div>
                 ))}
